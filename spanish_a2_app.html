@@ -1,0 +1,3162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>¡Español! — DELE A2 Mastery App</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getDatabase, ref, set, get, onValue }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // ── PASTE YOUR FIREBASE CONFIG HERE ──────────────────────────────────────
+  const firebaseConfig = {
+    apiKey:            "PASTE_YOUR_apiKey_HERE",
+    authDomain:        "PASTE_YOUR_authDomain_HERE",
+    databaseURL:       "PASTE_YOUR_databaseURL_HERE",
+    projectId:         "PASTE_YOUR_projectId_HERE",
+    storageBucket:     "PASTE_YOUR_storageBucket_HERE",
+    messagingSenderId: "PASTE_YOUR_messagingSenderId_HERE",
+    appId:             "PASTE_YOUR_appId_HERE",
+  };
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const FIREBASE_CONFIGURED = !Object.values(firebaseConfig).some(v => v.startsWith("PASTE_"));
+
+  let app, auth, db;
+  if (FIREBASE_CONFIGURED) {
+    app  = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db   = getDatabase(app);
+    console.log("✅ Firebase initialised");
+  } else {
+    console.warn("⚠️ Firebase config not filled in — running offline.");
+  }
+
+  let saveTimer = null;
+
+  // ── Wait for main script to be ready, then expose helpers ────────────────
+  function waitForApp(cb, attempts = 0) {
+    if (window.DEFAULT_STATE && window.STATE !== undefined) {
+      cb();
+    } else if (attempts < 50) {
+      setTimeout(() => waitForApp(cb, attempts + 1), 100);
+    } else {
+      console.error("❌ Main app script never became ready.");
+    }
+  }
+
+  waitForApp(() => {
+    console.log("✅ Main app ready — wiring Firebase");
+
+    window._firebase = {
+      configured: FIREBASE_CONFIGURED,
+
+      async login(email, password) {
+        try {
+          setAuthStatus('loading', 'Signing in…');
+          await signInWithEmailAndPassword(auth, email, password);
+        } catch (e) {
+          console.error("Login error:", e.code, e.message);
+          setAuthStatus('error', friendlyError(e.code));
+        }
+      },
+
+      async register(email, password) {
+        try {
+          setAuthStatus('loading', 'Creating account…');
+          await createUserWithEmailAndPassword(auth, email, password);
+        } catch (e) {
+          console.error("Register error:", e.code, e.message);
+          setAuthStatus('error', friendlyError(e.code));
+        }
+      },
+
+      async logout() {
+        await signOut(auth);
+      },
+
+      // Debounced save — called from saveState()
+      scheduleSave(state) {
+        if (!FIREBASE_CONFIGURED || !auth?.currentUser) {
+          console.warn("scheduleSave: not configured or no user");
+          return;
+        }
+        clearTimeout(saveTimer);
+        setSyncIndicator('pending');
+        saveTimer = setTimeout(async () => {
+          try {
+            const uid  = auth.currentUser.uid;
+            const path = ref(db, `users/${uid}/state`);
+            await set(path, state);
+            console.log("☁️ Saved to Firebase for uid:", uid);
+            setSyncIndicator('saved');
+          } catch (e) {
+            console.error("❌ Firebase save failed:", e.message);
+            setSyncIndicator('error');
+          }
+        }, 1500);
+      },
+
+      async pullState() {
+        if (!FIREBASE_CONFIGURED || !auth?.currentUser) return null;
+        try {
+          const uid  = auth.currentUser.uid;
+          const snap = await get(ref(db, `users/${uid}/state`));
+          console.log("📥 Pull from Firebase — exists:", snap.exists());
+          return snap.exists() ? snap.val() : null;
+        } catch (e) {
+          console.error("❌ Firebase pull failed:", e.message);
+          return null;
+        }
+      },
+    };
+
+    // ── Auth state observer ─────────────────────────────────────────────────
+    if (FIREBASE_CONFIGURED) {
+      onAuthStateChanged(auth, async (user) => {
+        console.log("🔐 Auth state changed — user:", user ? user.email : "null");
+
+        if (user) {
+          document.getElementById('authOverlay').style.display = 'none';
+          document.getElementById('userEmailDisplay').textContent = user.email;
+          document.getElementById('syncUserRow').style.display   = 'flex';
+
+          setSyncIndicator('loading');
+
+          const cloudState = await window._firebase.pullState();
+          if (cloudState) {
+            const local = window.STATE || {};
+            console.log("📊 Cloud XP:", cloudState.xp, "| Local XP:", local.xp);
+            // Merge into STATE in-place via _syncStateRef
+            const merged = {
+              ...window.DEFAULT_STATE,
+              ...cloudState,
+              xp:     Math.max(cloudState.xp || 0, local.xp || 0),
+              streak: Math.max(cloudState.streak || 0, local.streak || 0),
+            };
+            if (typeof window._syncStateRef === 'function') window._syncStateRef(merged);
+            localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
+            console.log("✅ State merged and applied");
+          } else {
+            console.log("ℹ️ No cloud state yet — will create on first save");
+            // Push local state up immediately so other devices can get it
+            window._firebase.scheduleSave(window.STATE);
+          }
+
+          setSyncIndicator('saved');
+
+          // Refresh UI
+          if (typeof window.updateTopBar      === 'function') window.updateTopBar();
+          if (typeof window.updateDashboard   === 'function') window.updateDashboard();
+          if (typeof window.renderLearnModules === 'function') window.renderLearnModules();
+
+          // Live listener — sync if another device saves higher XP
+          onValue(ref(db, `users/${user.uid}/state`), (snap) => {
+            if (!snap.exists()) return;
+            const remote = snap.val();
+            const current = window.STATE || {};
+            if (remote.xp > (current.xp || 0)) {
+              console.log("🔄 Remote state is newer — updating UI");
+              if (typeof window._syncStateRef === 'function') window._syncStateRef({ ...window.DEFAULT_STATE, ...remote });
+              localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
+              if (typeof window.updateTopBar    === 'function') window.updateTopBar();
+              if (typeof window.updateDashboard === 'function') window.updateDashboard();
+              setSyncIndicator('saved');
+            }
+          });
+
+        } else {
+          document.getElementById('authOverlay').style.display = 'flex';
+          document.getElementById('syncUserRow').style.display = 'none';
+          document.getElementById('userEmailDisplay').textContent = '';
+        }
+      });
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        const banner = document.getElementById('setupBanner');
+        if (banner) banner.style.display = 'flex';
+        const overlay = document.getElementById('authOverlay');
+        if (overlay) overlay.style.display = 'none';
+      });
+    }
+  }); // end waitForApp
+
+  function friendlyError(code) {
+    const map = {
+      'auth/user-not-found':       'No account found with that email.',
+      'auth/wrong-password':       'Incorrect password — try again.',
+      'auth/email-already-in-use': 'An account with this email already exists.',
+      'auth/invalid-email':        'Please enter a valid email address.',
+      'auth/weak-password':        'Password must be at least 6 characters.',
+      'auth/network-request-failed': 'Network error — check your connection.',
+      'auth/too-many-requests':    'Too many attempts. Please wait a moment.',
+      'auth/invalid-credential':   'Email or password is incorrect.',
+    };
+    return map[code] || `Error: ${code}`;
+  }
+
+  function setAuthStatus(type, msg) {
+    const el = document.getElementById('authStatus');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'auth-status ' + type;
+    el.style.display = msg ? 'block' : 'none';
+  }
+
+  function setSyncIndicator(state) {
+    const el = document.getElementById('syncIndicator');
+    if (!el) return;
+    const map = {
+      saved:   { icon:'☁️', text:'Synced',    color:'var(--success)' },
+      pending: { icon:'🔄', text:'Saving…',   color:'var(--accent)'  },
+      loading: { icon:'⏳', text:'Loading…',  color:'var(--text3)'   },
+      error:   { icon:'⚠️', text:'Sync error',color:'var(--danger)'  },
+    };
+    const s = map[state] || map.saved;
+    el.innerHTML = `<span>${s.icon}</span><span style="color:${s.color}">${s.text}</span>`;
+  }
+  window.setSyncIndicator = setSyncIndicator;
+</script>
+<style>
+:root {
+  --bg: #0d0d14;
+  --surface: #16161f;
+  --surface2: #1e1e2e;
+  --surface3: #252538;
+  --border: #2a2a3f;
+  --accent: #f5c842;
+  --accent2: #e8485a;
+  --accent3: #4ecdc4;
+  --accent4: #a78bfa;
+  --accent5: #fb923c;
+  --text: #f0eee8;
+  --text2: #a8a6b0;
+  --text3: #6b6878;
+  --success: #22c55e;
+  --danger: #e8485a;
+  --xp-color: #f5c842;
+  --radius: 16px;
+  --radius-sm: 10px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ===== SCROLLBAR ===== */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ===== SPLASH SCREEN ===== */
+#splash {
+  position: fixed; inset: 0;
+  background: var(--bg);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  z-index: 9999;
+  transition: opacity 0.6s ease;
+}
+#splash h1 {
+  font-family: 'Playfair Display', serif;
+  font-size: clamp(3rem, 8vw, 6rem);
+  color: var(--accent);
+  letter-spacing: -2px;
+  animation: fadeUp 0.8s ease forwards;
+}
+#splash p {
+  color: var(--text2);
+  font-size: 1.1rem;
+  margin-top: 0.5rem;
+  animation: fadeUp 0.8s 0.2s ease both;
+}
+#splash .loader {
+  margin-top: 3rem;
+  width: 200px; height: 4px;
+  background: var(--surface3);
+  border-radius: 2px;
+  overflow: hidden;
+  animation: fadeUp 0.8s 0.4s ease both;
+}
+#splash .loader-bar {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  border-radius: 2px;
+  animation: loadBar 1.8s ease forwards;
+}
+@keyframes loadBar { to { width: 100%; } }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ===== LAYOUT ===== */
+#app { display: none; min-height: 100vh; }
+
+/* ===== TOP BAR ===== */
+.topbar {
+  position: sticky; top: 0; z-index: 100;
+  background: rgba(13,13,20,0.92);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+  padding: 0.75rem 1.5rem;
+  display: flex; align-items: center; gap: 1rem;
+}
+.topbar-brand {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.4rem;
+  color: var(--accent);
+  font-style: italic;
+  white-space: nowrap;
+}
+.topbar-stats {
+  display: flex; gap: 1rem; align-items: center;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.stat-chip {
+  display: flex; align-items: center; gap: 0.4rem;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.stat-chip .icon { font-size: 1rem; }
+.xp-chip { border-color: rgba(245,200,66,0.3); color: var(--accent); }
+.streak-chip { border-color: rgba(251,146,60,0.3); color: var(--accent5); }
+.level-chip { border-color: rgba(167,139,250,0.3); color: var(--accent4); }
+
+/* ===== NAV TABS ===== */
+.nav {
+  display: flex; gap: 0; overflow-x: auto;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 1.5rem;
+}
+.nav::-webkit-scrollbar { height: 0; }
+.nav-tab {
+  display: flex; align-items: center; gap: 0.4rem;
+  padding: 0.9rem 1.2rem;
+  font-size: 0.85rem; font-weight: 500;
+  color: var(--text3);
+  border: none; background: none;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.nav-tab:hover { color: var(--text2); }
+.nav-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+.nav-tab .tab-icon { font-size: 1rem; }
+.tab-badge {
+  background: var(--accent2);
+  color: white;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 0.1rem 0.4rem;
+  border-radius: 100px;
+}
+
+/* ===== MAIN CONTENT ===== */
+.main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
+.tab-content { display: none; }
+.tab-content.active { display: block; animation: fadeIn 0.3s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ===== CARDS ===== */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+}
+.card-sm { padding: 1rem; border-radius: var(--radius-sm); }
+.card-accent { border-color: rgba(245,200,66,0.25); background: linear-gradient(135deg, var(--surface), rgba(245,200,66,0.05)); }
+
+/* ===== GRID ===== */
+.grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+.grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+.grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; }
+
+/* ===== HEADINGS ===== */
+.section-title {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.6rem;
+  margin-bottom: 1.25rem;
+  color: var(--text);
+}
+.section-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text3);
+  margin-bottom: 0.75rem;
+}
+
+/* ===== BUTTONS ===== */
+.btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  padding: 0.7rem 1.4rem;
+  border-radius: 100px;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.9rem; font-weight: 600;
+  border: none; cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-primary { background: var(--accent); color: #0d0d14; }
+.btn-primary:hover { background: #ffd53f; transform: translateY(-1px); box-shadow: 0 4px 20px rgba(245,200,66,0.3); }
+.btn-outline { background: transparent; color: var(--text); border: 1.5px solid var(--border); }
+.btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+.btn-danger { background: var(--danger); color: white; }
+.btn-success { background: var(--success); color: white; }
+.btn-lg { padding: 1rem 2rem; font-size: 1rem; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none !important; }
+
+/* ===== PROGRESS BAR ===== */
+.progress-bar {
+  height: 8px; background: var(--surface3);
+  border-radius: 4px; overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--accent), var(--accent5));
+  transition: width 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* ===== XP BAR ===== */
+.xp-bar-container {
+  display: flex; align-items: center; gap: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+.xp-label { font-size: 0.8rem; color: var(--text3); white-space: nowrap; }
+.xp-bar { flex: 1; height: 6px; background: var(--surface3); border-radius: 3px; overflow: hidden; }
+.xp-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 3px; transition: width 0.8s cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+/* ===== DASHBOARD ===== */
+.welcome-banner {
+  background: linear-gradient(135deg, var(--surface2), rgba(167,139,250,0.08));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2rem;
+  margin-bottom: 1.5rem;
+  position: relative;
+  overflow: hidden;
+}
+.welcome-banner::before {
+  content: '¡Hola!';
+  position: absolute; right: 2rem; top: 50%;
+  transform: translateY(-50%);
+  font-family: 'Playfair Display', serif;
+  font-size: 5rem;
+  color: rgba(245,200,66,0.06);
+  font-style: italic;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.welcome-banner h2 { font-family: 'Playfair Display', serif; font-size: 1.8rem; margin-bottom: 0.5rem; }
+.welcome-banner p { color: var(--text2); }
+
+.topic-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  cursor: pointer;
+  transition: all 0.25s;
+  position: relative;
+  overflow: hidden;
+}
+.topic-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 8px 30px rgba(0,0,0,0.3); }
+.topic-card .topic-icon { font-size: 2rem; margin-bottom: 0.75rem; }
+.topic-card h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.25rem; }
+.topic-card p { font-size: 0.8rem; color: var(--text3); margin-bottom: 0.75rem; }
+.topic-card .topic-progress { font-size: 0.75rem; color: var(--text3); display: flex; justify-content: space-between; }
+.topic-pill {
+  display: inline-block;
+  font-size: 0.7rem; font-weight: 700;
+  padding: 0.2rem 0.6rem;
+  border-radius: 100px;
+  margin-bottom: 0.5rem;
+}
+.pill-grammar { background: rgba(167,139,250,0.15); color: var(--accent4); }
+.pill-vocab { background: rgba(78,205,196,0.15); color: var(--accent3); }
+.pill-verb { background: rgba(232,72,90,0.15); color: var(--accent2); }
+.pill-culture { background: rgba(245,200,66,0.15); color: var(--accent); }
+.pill-skill { background: rgba(251,146,60,0.15); color: var(--accent5); }
+
+/* ===== LESSON VIEW ===== */
+#lessonView {
+  position: fixed; inset: 0; z-index: 500;
+  background: var(--bg);
+  display: none; flex-direction: column;
+  overflow-y: auto;
+}
+#lessonView.open { display: flex; animation: slideUp 0.3s ease; }
+@keyframes slideUp { from { transform: translateY(30px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+.lesson-header {
+  position: sticky; top: 0;
+  background: rgba(13,13,20,0.95);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+  padding: 1rem 1.5rem;
+  display: flex; align-items: center; gap: 1rem; z-index: 10;
+}
+.lesson-progress-bar { flex: 1; height: 8px; background: var(--surface3); border-radius: 4px; overflow: hidden; }
+.lesson-progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent3), var(--accent)); border-radius: 4px; transition: width 0.4s ease; }
+.lesson-close {
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text2); border-radius: 50%; width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; font-size: 1.1rem; flex-shrink: 0;
+}
+.lesson-xp-counter {
+  font-family: 'Space Mono', monospace;
+  font-size: 0.85rem; color: var(--accent);
+  white-space: nowrap;
+}
+
+.lesson-body { flex: 1; max-width: 760px; margin: 0 auto; width: 100%; padding: 2rem 1.5rem; }
+
+/* ===== EXERCISE CARDS ===== */
+.exercise-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2rem;
+  margin-bottom: 1rem;
+  animation: fadeIn 0.3s ease;
+}
+.exercise-type-badge {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  font-size: 0.7rem; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 0.3rem 0.7rem;
+  border-radius: 100px;
+  margin-bottom: 1rem;
+}
+.badge-mc { background: rgba(167,139,250,0.15); color: var(--accent4); }
+.badge-fill { background: rgba(78,205,196,0.15); color: var(--accent3); }
+.badge-translate { background: rgba(245,200,66,0.15); color: var(--accent); }
+.badge-match { background: rgba(251,146,60,0.15); color: var(--accent5); }
+.badge-listen { background: rgba(232,72,90,0.15); color: var(--accent2); }
+.badge-speak { background: rgba(34,197,94,0.15); color: var(--success); }
+
+.exercise-question {
+  font-size: 1.3rem; font-weight: 600;
+  line-height: 1.4; margin-bottom: 1.5rem;
+  font-family: 'Playfair Display', serif;
+}
+.exercise-hint {
+  font-size: 0.85rem; color: var(--text3);
+  margin-bottom: 1.5rem; font-style: italic;
+}
+
+/* Multiple Choice */
+.choices { display: flex; flex-direction: column; gap: 0.75rem; }
+.choice-btn {
+  text-align: left;
+  background: var(--surface2);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1rem 1.25rem;
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex; align-items: center; gap: 0.75rem;
+}
+.choice-btn:hover:not(:disabled) { border-color: var(--accent); background: rgba(245,200,66,0.05); }
+.choice-btn.correct { border-color: var(--success); background: rgba(34,197,94,0.1); color: var(--success); }
+.choice-btn.wrong { border-color: var(--danger); background: rgba(232,72,90,0.1); color: var(--danger); }
+.choice-btn:disabled { cursor: default; }
+.choice-letter {
+  width: 28px; height: 28px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.8rem; font-weight: 700;
+  flex-shrink: 0;
+  opacity: 0.6;
+}
+
+/* Fill in the blank */
+.fill-input {
+  background: var(--surface2);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.9rem 1.2rem;
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 1rem;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.fill-input:focus { border-color: var(--accent); }
+.fill-input.correct { border-color: var(--success); background: rgba(34,197,94,0.08); }
+.fill-input.wrong { border-color: var(--danger); background: rgba(232,72,90,0.08); }
+
+/* Matching */
+.match-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+.match-item {
+  background: var(--surface2);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 0.9rem; font-weight: 500;
+  text-align: center;
+}
+.match-item:hover { border-color: var(--accent); }
+.match-item.selected { border-color: var(--accent); background: rgba(245,200,66,0.1); color: var(--accent); }
+.match-item.matched-correct { border-color: var(--success); background: rgba(34,197,94,0.1); color: var(--success); cursor: default; }
+.match-item.matched-wrong { border-color: var(--danger); background: rgba(232,72,90,0.1); color: var(--danger); }
+
+/* Word order */
+.word-bank { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; min-height: 48px; }
+.word-chip {
+  background: var(--surface2);
+  border: 1.5px solid var(--border);
+  border-radius: 100px;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem; font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.word-chip:hover { border-color: var(--accent); color: var(--accent); }
+.word-chip.used { opacity: 0.3; cursor: default; }
+.answer-area {
+  min-height: 60px;
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  display: flex; flex-wrap: wrap; gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.answer-chip {
+  background: rgba(245,200,66,0.1);
+  border: 1.5px solid rgba(245,200,66,0.3);
+  color: var(--accent);
+  border-radius: 100px;
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem; font-weight: 500;
+  cursor: pointer;
+  display: flex; align-items: center; gap: 0.4rem;
+}
+
+/* Feedback */
+.feedback-area {
+  margin-top: 1.25rem;
+  padding: 1rem 1.25rem;
+  border-radius: var(--radius-sm);
+  display: none; animation: fadeIn 0.3s ease;
+}
+.feedback-area.show { display: block; }
+.feedback-correct { background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.3); }
+.feedback-wrong { background: rgba(232,72,90,0.1); border: 1px solid rgba(232,72,90,0.3); }
+.feedback-title { font-weight: 700; margin-bottom: 0.35rem; font-size: 0.95rem; }
+.feedback-correct .feedback-title { color: var(--success); }
+.feedback-wrong .feedback-title { color: var(--danger); }
+.feedback-text { font-size: 0.875rem; color: var(--text2); line-height: 1.5; }
+
+/* Audio button */
+.audio-btn {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 100px; padding: 0.5rem 1rem;
+  font-size: 0.85rem; color: var(--text2);
+  cursor: pointer; transition: all 0.2s;
+  margin-bottom: 1rem;
+}
+.audio-btn:hover { border-color: var(--accent3); color: var(--accent3); }
+.audio-btn.playing { border-color: var(--accent3); color: var(--accent3); animation: pulse 1s ease infinite; }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(78,205,196,0.3); } 50% { box-shadow: 0 0 0 6px rgba(78,205,196,0); } }
+
+/* Lesson result */
+.result-screen { text-align: center; padding: 3rem 1rem; }
+.result-trophy { font-size: 5rem; margin-bottom: 1rem; animation: bounceIn 0.6s cubic-bezier(0.34,1.56,0.64,1); }
+@keyframes bounceIn { from { transform: scale(0); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.result-title { font-family: 'Playfair Display', serif; font-size: 2.5rem; margin-bottom: 0.5rem; color: var(--accent); }
+.result-stats { display: flex; justify-content: center; gap: 2rem; margin: 2rem 0; flex-wrap: wrap; }
+.result-stat { text-align: center; }
+.result-stat .value { font-family: 'Space Mono', monospace; font-size: 2rem; font-weight: 700; display: block; }
+.result-stat .label { font-size: 0.8rem; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; }
+
+/* ===== VOCABULARY TAB ===== */
+.vocab-filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+.filter-btn {
+  padding: 0.4rem 0.9rem; border-radius: 100px;
+  font-size: 0.8rem; font-weight: 600;
+  border: 1.5px solid var(--border);
+  background: transparent; color: var(--text2); cursor: pointer;
+  transition: all 0.2s;
+}
+.filter-btn.active { background: var(--accent); color: #0d0d14; border-color: var(--accent); }
+.filter-btn:hover:not(.active) { border-color: var(--text2); color: var(--text); }
+
+.flashcard-container { perspective: 1000px; }
+.flashcard {
+  width: 100%; max-width: 520px; height: 280px;
+  margin: 0 auto 1.5rem;
+  position: relative; cursor: pointer;
+  transform-style: preserve-3d;
+  transition: transform 0.5s cubic-bezier(0.4,0,0.2,1);
+}
+.flashcard.flipped { transform: rotateY(180deg); }
+.flashcard-face {
+  position: absolute; inset: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  backface-visibility: hidden;
+  padding: 2rem;
+}
+.flashcard-back { transform: rotateY(180deg); background: linear-gradient(135deg, var(--surface2), rgba(78,205,196,0.08)); border-color: rgba(78,205,196,0.2); }
+.flashcard-word { font-family: 'Playfair Display', serif; font-size: 2.5rem; text-align: center; }
+.flashcard-translation { font-size: 1.5rem; color: var(--accent3); font-weight: 600; text-align: center; }
+.flashcard-example { font-size: 0.9rem; color: var(--text2); font-style: italic; text-align: center; margin-top: 0.75rem; }
+.flashcard-hint { font-size: 0.75rem; color: var(--text3); margin-top: auto; }
+.flashcard-category { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text3); margin-bottom: 0.5rem; }
+
+.vocab-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 0.75rem; }
+.vocab-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.vocab-tile:hover { border-color: var(--accent3); }
+.vocab-tile .es { font-size: 1rem; font-weight: 600; margin-bottom: 0.25rem; }
+.vocab-tile .en { font-size: 0.8rem; color: var(--text3); }
+.vocab-tile .mastery { margin-top: 0.5rem; height: 3px; background: var(--surface3); border-radius: 2px; overflow: hidden; }
+.vocab-tile .mastery-fill { height: 100%; background: var(--accent3); border-radius: 2px; }
+.vocab-tile.mastered { border-color: rgba(34,197,94,0.3); }
+
+/* ===== GRAMMAR TAB ===== */
+.grammar-section { margin-bottom: 2.5rem; }
+.grammar-rule {
+  background: var(--surface2);
+  border-left: 3px solid var(--accent4);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding: 1.25rem 1.5rem;
+  margin: 0.75rem 0;
+  font-size: 0.9rem; line-height: 1.7; color: var(--text2);
+}
+.grammar-rule code {
+  font-family: 'Space Mono', monospace;
+  background: rgba(167,139,250,0.15);
+  color: var(--accent4);
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+.example-sentence {
+  background: var(--surface3);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+  font-style: italic;
+}
+.example-sentence .es { color: var(--text); font-weight: 500; }
+.example-sentence .en { color: var(--text3); font-size: 0.85rem; margin-top: 0.25rem; }
+.conjugation-table {
+  width: 100%; border-collapse: collapse;
+  margin: 1rem 0; font-size: 0.9rem;
+}
+.conjugation-table th {
+  background: var(--surface3);
+  padding: 0.6rem 1rem;
+  text-align: left; font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  color: var(--text2);
+}
+.conjugation-table td {
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.conjugation-table tr:last-child td { border-bottom: none; }
+.conjugation-table .pronoun { color: var(--text3); font-size: 0.85rem; }
+.conjugation-table .verb-form { font-weight: 600; color: var(--accent4); font-family: 'Space Mono', monospace; }
+.conjugation-table .meaning { color: var(--text3); }
+
+/* ===== ACHIEVEMENTS TAB ===== */
+.badge-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 1rem; }
+.badge-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem 1rem;
+  text-align: center;
+  transition: all 0.25s;
+  position: relative;
+}
+.badge-card.earned { border-color: rgba(245,200,66,0.3); }
+.badge-card.earned:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(0,0,0,0.3); }
+.badge-card.locked { opacity: 0.4; }
+.badge-icon { font-size: 2.5rem; margin-bottom: 0.75rem; display: block; }
+.badge-name { font-size: 0.85rem; font-weight: 700; margin-bottom: 0.25rem; }
+.badge-desc { font-size: 0.75rem; color: var(--text3); line-height: 1.4; }
+.badge-earned-tag {
+  position: absolute; top: 0.5rem; right: 0.5rem;
+  background: var(--accent); color: #0d0d14;
+  font-size: 0.6rem; font-weight: 800;
+  padding: 0.2rem 0.4rem; border-radius: 4px;
+  letter-spacing: 0.05em;
+}
+
+.trophy-display {
+  display: flex; gap: 1.5rem;
+  flex-wrap: wrap; margin-bottom: 2rem;
+}
+.trophy-card {
+  flex: 1; min-width: 200px;
+  background: linear-gradient(135deg, var(--surface2), rgba(245,200,66,0.05));
+  border: 1px solid rgba(245,200,66,0.2);
+  border-radius: var(--radius);
+  padding: 1.5rem; text-align: center;
+}
+.trophy-icon { font-size: 3rem; display: block; margin-bottom: 0.5rem; }
+.trophy-title { font-family: 'Playfair Display', serif; font-size: 1.2rem; margin-bottom: 0.25rem; }
+.trophy-req { font-size: 0.8rem; color: var(--text3); }
+
+/* ===== PROGRESS TAB ===== */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  text-align: center;
+}
+.stat-card .big-num {
+  font-family: 'Space Mono', monospace;
+  font-size: 2.5rem; font-weight: 700;
+  display: block; margin-bottom: 0.25rem;
+}
+.stat-card .stat-name { font-size: 0.8rem; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; }
+
+.skill-meter { margin-bottom: 1.25rem; }
+.skill-meter-header { display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.9rem; }
+.skill-meter-label { font-weight: 600; }
+.skill-meter-val { color: var(--text3); font-family: 'Space Mono', monospace; font-size: 0.8rem; }
+.skill-bar { height: 10px; background: var(--surface3); border-radius: 5px; overflow: hidden; }
+.skill-fill { height: 100%; border-radius: 5px; transition: width 0.8s cubic-bezier(0.34,1.56,0.64,1); }
+
+/* ===== PRACTICE TAB ===== */
+.practice-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+.practice-mode-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  cursor: pointer;
+  transition: all 0.25s;
+  text-align: center;
+}
+.practice-mode-card:hover { transform: translateY(-3px); box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
+.practice-mode-card .mode-icon { font-size: 2.5rem; display: block; margin-bottom: 0.75rem; }
+.practice-mode-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 0.4rem; }
+.practice-mode-card p { font-size: 0.8rem; color: var(--text3); }
+
+/* ===== TOAST NOTIFICATION ===== */
+#toast {
+  position: fixed; bottom: 2rem; left: 50%;
+  transform: translateX(-50%) translateY(100px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  padding: 0.75rem 1.5rem;
+  font-size: 0.9rem; font-weight: 600;
+  z-index: 9000;
+  display: flex; align-items: center; gap: 0.75rem;
+  transition: transform 0.4s cubic-bezier(0.34,1.56,0.64,1);
+  box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+}
+#toast.show { transform: translateX(-50%) translateY(0); }
+#toast.xp-toast { border-color: rgba(245,200,66,0.4); }
+#toast.badge-toast { border-color: rgba(167,139,250,0.4); }
+
+/* ===== XP POPUP ===== */
+.xp-popup {
+  position: fixed; pointer-events: none;
+  font-family: 'Space Mono', monospace;
+  font-size: 1.4rem; font-weight: 700;
+  color: var(--accent);
+  z-index: 9000;
+  animation: xpFloat 1.5s ease forwards;
+}
+@keyframes xpFloat {
+  0% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-80px) scale(1.3); }
+}
+
+/* ===== DAILY CHALLENGE ===== */
+.daily-challenge-banner {
+  background: linear-gradient(135deg, rgba(232,72,90,0.15), rgba(167,139,250,0.15));
+  border: 1px solid rgba(232,72,90,0.25);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  display: flex; align-items: center; gap: 1rem;
+  cursor: pointer; margin-bottom: 1.5rem;
+  transition: all 0.2s;
+}
+.daily-challenge-banner:hover { border-color: var(--accent2); transform: translateY(-1px); }
+.dc-icon { font-size: 2rem; flex-shrink: 0; }
+.dc-info h3 { font-size: 1rem; font-weight: 700; }
+.dc-info p { font-size: 0.85rem; color: var(--text2); margin-top: 0.1rem; }
+.dc-badge { margin-left: auto; background: var(--accent2); color: white; font-size: 0.75rem; font-weight: 700; padding: 0.3rem 0.8rem; border-radius: 100px; flex-shrink: 0; }
+
+/* ===== FIREBASE AUTH OVERLAY ===== */
+#authOverlay {
+  position: fixed; inset: 0; z-index: 10000;
+  background: var(--bg);
+  display: flex; align-items: center; justify-content: center;
+  padding: 1.5rem;
+}
+.auth-box {
+  width: 100%; max-width: 400px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2.5rem 2rem;
+  animation: fadeUp 0.4s ease;
+}
+.auth-logo {
+  font-family: 'Playfair Display', serif;
+  font-size: 2.5rem; color: var(--accent);
+  font-style: italic; text-align: center;
+  margin-bottom: 0.25rem;
+}
+.auth-tagline {
+  text-align: center; color: var(--text3);
+  font-size: 0.85rem; margin-bottom: 2rem;
+}
+.auth-tabs {
+  display: flex; border-bottom: 1px solid var(--border);
+  margin-bottom: 1.5rem;
+}
+.auth-tab-btn {
+  flex: 1; padding: 0.65rem;
+  background: none; border: none;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.9rem; font-weight: 600;
+  color: var(--text3); cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+.auth-tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.auth-field {
+  margin-bottom: 1rem;
+}
+.auth-field label {
+  display: block; font-size: 0.8rem;
+  font-weight: 600; color: var(--text2);
+  margin-bottom: 0.4rem; letter-spacing: 0.05em;
+}
+.auth-input {
+  width: 100%; padding: 0.75rem 1rem;
+  background: var(--surface2);
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text); font-family: 'DM Sans', sans-serif;
+  font-size: 0.95rem; outline: none;
+  transition: border-color 0.2s;
+}
+.auth-input:focus { border-color: var(--accent); }
+.auth-btn {
+  width: 100%; padding: 0.85rem;
+  background: var(--accent); color: #0d0d14;
+  border: none; border-radius: var(--radius-sm);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 1rem; font-weight: 700;
+  cursor: pointer; margin-top: 0.5rem;
+  transition: all 0.2s;
+}
+.auth-btn:hover { background: #ffd53f; }
+.auth-btn:disabled { opacity: 0.5; cursor: default; }
+.auth-status {
+  padding: 0.65rem 0.9rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem; margin-top: 0.75rem;
+  display: none;
+}
+.auth-status.error   { background: rgba(232,72,90,0.12); color: var(--danger); border: 1px solid rgba(232,72,90,0.3); }
+.auth-status.loading { background: rgba(245,200,66,0.08); color: var(--accent); border: 1px solid rgba(245,200,66,0.2); }
+.auth-divider {
+  text-align: center; color: var(--text3);
+  font-size: 0.8rem; margin: 1.25rem 0 0;
+}
+.auth-skip {
+  background: none; border: none;
+  color: var(--text3); font-size: 0.8rem;
+  cursor: pointer; text-decoration: underline;
+  font-family: 'DM Sans', sans-serif;
+}
+.auth-skip:hover { color: var(--text2); }
+
+/* ===== SYNC INDICATOR ===== */
+#syncIndicator {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  font-size: 0.75rem; color: var(--text3);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 100px; padding: 0.25rem 0.7rem;
+}
+#syncUserRow {
+  display: none; align-items: center; gap: 0.75rem;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+#syncUserRow .user-email { color: var(--text2); flex: 1; }
+.logout-btn {
+  background: none; border: 1px solid var(--border);
+  border-radius: 100px; padding: 0.2rem 0.7rem;
+  color: var(--text3); font-size: 0.75rem;
+  cursor: pointer; font-family: 'DM Sans', sans-serif;
+  transition: all 0.2s;
+}
+.logout-btn:hover { border-color: var(--danger); color: var(--danger); }
+
+/* ===== SETUP BANNER ===== */
+#setupBanner {
+  display: none; align-items: flex-start; gap: 1rem;
+  background: linear-gradient(135deg, rgba(245,200,66,0.08), rgba(167,139,250,0.06));
+  border: 1px solid rgba(245,200,66,0.25);
+  border-radius: var(--radius); padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+#setupBanner .setup-icon { font-size: 1.5rem; flex-shrink:0; }
+#setupBanner h4 { font-size: 0.95rem; font-weight: 700; margin-bottom: 0.25rem; }
+#setupBanner p { font-size: 0.82rem; color: var(--text2); line-height: 1.5; }
+#setupBanner code {
+  font-family: 'Space Mono', monospace;
+  background: var(--surface3); padding: 0.1rem 0.4rem;
+  border-radius: 4px; font-size: 0.78rem; color: var(--accent);
+}
+
+@media (max-width: 600px) {
+  .main { padding: 1rem; }
+  .exercise-card { padding: 1.25rem; }
+  .topbar-stats .stat-chip:not(:first-child) { display: none; }
+  .match-columns { grid-template-columns: 1fr; }
+}
+
+/* ===== MODAL ===== */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7);
+  backdrop-filter: blur(8px);
+  z-index: 800; display: none;
+  align-items: center; justify-content: center;
+  padding: 1rem;
+}
+.modal-overlay.open { display: flex; animation: fadeIn 0.2s ease; }
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 2rem;
+  max-width: 480px; width: 100%;
+  animation: fadeUp 0.3s ease;
+}
+.modal h2 { font-family: 'Playfair Display', serif; font-size: 1.6rem; margin-bottom: 0.5rem; }
+.modal p { color: var(--text2); font-size: 0.9rem; line-height: 1.6; margin-bottom: 1.25rem; }
+
+/* Lesson continue button */
+.lesson-continue-btn {
+  width: 100%;
+  padding: 1rem;
+  background: var(--accent);
+  color: #0d0d14;
+  border: none; border-radius: var(--radius-sm);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 1rem; font-weight: 700;
+  cursor: pointer; margin-top: 1.5rem;
+  transition: all 0.2s;
+}
+.lesson-continue-btn:hover { background: #ffd53f; }
+.lesson-continue-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Speaking / listening */
+.mic-area {
+  text-align: center; padding: 1.5rem;
+}
+.mic-btn {
+  width: 80px; height: 80px;
+  border-radius: 50%;
+  background: var(--surface2);
+  border: 2px solid var(--border);
+  font-size: 2rem;
+  cursor: pointer; transition: all 0.2s;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text);
+}
+.mic-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+.mic-btn.recording { background: rgba(232,72,90,0.15); border-color: var(--accent2); animation: pulse-red 1s infinite; }
+@keyframes pulse-red { 0%,100% { box-shadow: 0 0 0 0 rgba(232,72,90,0.3); } 50% { box-shadow: 0 0 0 12px rgba(232,72,90,0); } }
+
+/* Level up animation */
+.level-up-overlay {
+  position: fixed; inset: 0; z-index: 9500;
+  background: rgba(0,0,0,0.8);
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column;
+  animation: fadeIn 0.3s ease;
+}
+.level-up-text {
+  font-family: 'Playfair Display', serif;
+  font-size: clamp(3rem, 10vw, 6rem);
+  color: var(--accent);
+  text-shadow: 0 0 60px rgba(245,200,66,0.5);
+  animation: levelPop 0.6s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes levelPop { from { transform: scale(0.3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.confetti { position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 9600; }
+
+/* Difficulty indicator */
+.difficulty-stars { display: flex; gap: 2px; }
+.difficulty-stars span { font-size: 0.75rem; }
+
+/* Search box */
+.search-box {
+  background: var(--surface2);
+  border: 1.5px solid var(--border);
+  border-radius: 100px;
+  padding: 0.6rem 1.2rem;
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.9rem;
+  outline: none; width: 100%; max-width: 320px;
+  transition: border-color 0.2s;
+  margin-bottom: 1rem;
+}
+.search-box:focus { border-color: var(--accent); }
+
+/* Streak calendar */
+.streak-calendar { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.streak-day {
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.6rem; font-weight: 700; color: var(--text3);
+}
+.streak-day.done { background: rgba(245,200,66,0.2); color: var(--accent); }
+.streak-day.today { border: 1.5px solid var(--accent); }
+.streak-day.empty { background: var(--surface3); }
+
+/* Word of the day */
+.wotd {
+  background: linear-gradient(135deg, rgba(78,205,196,0.1), rgba(167,139,250,0.08));
+  border: 1px solid rgba(78,205,196,0.2);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+.wotd-label { font-size: 0.7rem; font-weight: 800; letter-spacing: 0.15em; text-transform: uppercase; color: var(--accent3); margin-bottom: 0.5rem; }
+.wotd-word { font-family: 'Playfair Display', serif; font-size: 2rem; margin-bottom: 0.25rem; }
+.wotd-type { font-size: 0.8rem; color: var(--text3); font-style: italic; margin-bottom: 0.5rem; }
+.wotd-meaning { font-size: 1rem; color: var(--text2); }
+.wotd-example { font-size: 0.85rem; color: var(--text3); font-style: italic; margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+
+<!-- SPLASH -->
+<div id="splash">
+  <h1>¡Español!</h1>
+  <p>DELE A2 Mastery — Your journey to fluency begins now</p>
+  <div class="loader"><div class="loader-bar"></div></div>
+</div>
+
+<!-- AUTH OVERLAY -->
+<div id="authOverlay">
+  <div class="auth-box">
+    <div class="auth-logo">¡Español!</div>
+    <div class="auth-tagline">Sign in to sync your progress across all devices</div>
+
+    <div class="auth-tabs">
+      <button class="auth-tab-btn active" onclick="switchAuthTab('login', this)">Sign In</button>
+      <button class="auth-tab-btn" onclick="switchAuthTab('register', this)">Create Account</button>
+    </div>
+
+    <div id="authFormLogin">
+      <div class="auth-field">
+        <label>EMAIL</label>
+        <input class="auth-input" id="loginEmail" type="email" placeholder="you@email.com" autocomplete="email" />
+      </div>
+      <div class="auth-field">
+        <label>PASSWORD</label>
+        <input class="auth-input" id="loginPassword" type="password" placeholder="Your password"
+          autocomplete="current-password"
+          onkeydown="if(event.key==='Enter')doLogin()" />
+      </div>
+      <button class="auth-btn" onclick="doLogin()">Sign In →</button>
+    </div>
+
+    <div id="authFormRegister" style="display:none;">
+      <div class="auth-field">
+        <label>EMAIL</label>
+        <input class="auth-input" id="regEmail" type="email" placeholder="you@email.com" autocomplete="email" />
+      </div>
+      <div class="auth-field">
+        <label>PASSWORD (min 6 chars)</label>
+        <input class="auth-input" id="regPassword" type="password" placeholder="Create a password"
+          autocomplete="new-password"
+          onkeydown="if(event.key==='Enter')doRegister()" />
+      </div>
+      <button class="auth-btn" onclick="doRegister()">Create Account →</button>
+    </div>
+
+    <div class="auth-status" id="authStatus"></div>
+
+    <div class="auth-divider">
+      No account yet? <button class="auth-skip" onclick="skipAuth()">Continue without syncing</button>
+    </div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app">
+  <!-- SYNC USER ROW -->
+  <div id="syncUserRow">
+    <span>👤</span>
+    <span class="user-email" id="userEmailDisplay"></span>
+    <div id="syncIndicator"><span>☁️</span><span style="color:var(--success)">Synced</span></div>
+    <button class="logout-btn" onclick="doLogout()">Sign out</button>
+  </div>
+
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-brand">¡Español!</div>
+    <div style="flex:1; display:flex; align-items:center; gap:0.75rem;">
+      <div style="flex:1; max-width:200px;">
+        <div class="xp-bar-container">
+          <span class="xp-label" id="levelLabel">Lv.1</span>
+          <div class="xp-bar"><div class="xp-fill" id="xpFill" style="width:0%"></div></div>
+          <span class="xp-label" id="xpLabel">0/100</span>
+        </div>
+      </div>
+    </div>
+    <div class="topbar-stats">
+      <div class="stat-chip xp-chip"><span class="icon">⚡</span><span id="totalXpDisplay">0</span> XP</div>
+      <div class="stat-chip streak-chip"><span class="icon">🔥</span><span id="streakDisplay">0</span></div>
+      <div class="stat-chip level-chip"><span class="icon">🏆</span><span id="levelDisplay">Principiante</span></div>
+    </div>
+  </header>
+
+  <!-- NAV TABS -->
+  <nav class="nav">
+    <button class="nav-tab active" onclick="switchTab('dashboard')" id="tab-dashboard">
+      <span class="tab-icon">🏠</span> Dashboard
+    </button>
+    <button class="nav-tab" onclick="switchTab('learn')" id="tab-learn">
+      <span class="tab-icon">📚</span> Learn
+    </button>
+    <button class="nav-tab" onclick="switchTab('vocabulary')" id="tab-vocabulary">
+      <span class="tab-icon">🗂️</span> Vocabulary
+    </button>
+    <button class="nav-tab" onclick="switchTab('grammar')" id="tab-grammar">
+      <span class="tab-icon">📝</span> Grammar
+    </button>
+    <button class="nav-tab" onclick="switchTab('practice')" id="tab-practice">
+      <span class="tab-icon">🎯</span> Practice
+    </button>
+    <button class="nav-tab" onclick="switchTab('achievements')" id="tab-achievements">
+      <span class="tab-icon">🥇</span> Achievements
+    </button>
+    <button class="nav-tab" onclick="switchTab('progress')" id="tab-progress">
+      <span class="tab-icon">📊</span> Progress
+    </button>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="main">
+
+    <!-- ===== DASHBOARD ===== -->
+    <div id="tab-content-dashboard" class="tab-content active">
+      <div id="setupBanner">
+        <div class="setup-icon">🔧</div>
+        <div>
+          <h4>Firebase not configured yet</h4>
+          <p>To enable cross-device sync, open the HTML file, find <code>PASTE_YOUR_apiKey_HERE</code> and replace the config block with your Firebase project details. See the setup guide below.</p>
+        </div>
+      </div>
+
+      <div class="welcome-banner">
+        <h2>¡Bienvenida, Khushi! 👋</h2>
+        <p>Ready for today's Spanish session? You're on your way to DELE A2 mastery.</p>
+      </div>
+
+      <!-- Word of the Day -->
+      <div class="wotd" id="wotdBlock">
+        <div class="wotd-label">🌟 Word of the Day</div>
+        <div class="wotd-word" id="wotdWord">—</div>
+        <div class="wotd-type" id="wotdType">—</div>
+        <div class="wotd-meaning" id="wotdMeaning">—</div>
+        <div class="wotd-example" id="wotdExample">—</div>
+      </div>
+
+      <!-- Daily Challenge Banner -->
+      <div class="daily-challenge-banner" onclick="startDailyChallenge()">
+        <div class="dc-icon">🎯</div>
+        <div class="dc-info">
+          <h3>Daily Challenge</h3>
+          <p>Complete 10 questions to earn 2× XP bonus today!</p>
+        </div>
+        <div class="dc-badge" id="dcStatus">START</div>
+      </div>
+
+      <div class="section-label">Continue Learning</div>
+      <div class="grid-3" id="topicsGrid"></div>
+
+      <div style="height:1.5rem"></div>
+      <div class="section-label">Your Stats</div>
+      <div class="grid-4">
+        <div class="stat-card">
+          <span class="big-num" id="dashWordsLearned" style="color:var(--accent3)">0</span>
+          <span class="stat-name">Words Learned</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="dashLessons" style="color:var(--accent4)">0</span>
+          <span class="stat-name">Lessons Done</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="dashAccuracy" style="color:var(--accent)">—</span>
+          <span class="stat-name">Accuracy</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="dashStreak" style="color:var(--accent5)">0🔥</span>
+          <span class="stat-name">Day Streak</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== LEARN TAB ===== -->
+    <div id="tab-content-learn" class="tab-content">
+      <h2 class="section-title">📚 Learning Modules</h2>
+      <p style="color:var(--text2);margin-bottom:1.5rem;">Complete all modules to be fully prepared for DELE A2.</p>
+      <div id="learnModules"></div>
+    </div>
+
+    <!-- ===== VOCABULARY TAB ===== -->
+    <div id="tab-content-vocabulary" class="tab-content">
+      <h2 class="section-title">🗂️ Vocabulary Bank</h2>
+      <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;margin-bottom:1rem;">
+        <input type="text" class="search-box" placeholder="Search words..." oninput="filterVocab(this.value)" />
+        <div class="vocab-filters" id="vocabFilters"></div>
+      </div>
+      <div style="display:flex;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap;">
+        <button class="btn btn-outline" onclick="showFlashcards()">🃏 Flashcard Mode</button>
+        <button class="btn btn-outline" onclick="startVocabQuiz()">🎯 Quick Quiz</button>
+      </div>
+      <div class="vocab-grid" id="vocabGrid"></div>
+    </div>
+
+    <!-- ===== GRAMMAR TAB ===== -->
+    <div id="tab-content-grammar" class="tab-content">
+      <h2 class="section-title">📝 Grammar Guide</h2>
+      <p style="color:var(--text2);margin-bottom:1.5rem;">Every grammar rule you need for DELE A2, with examples.</p>
+      <div id="grammarContent"></div>
+    </div>
+
+    <!-- ===== PRACTICE TAB ===== -->
+    <div id="tab-content-practice" class="tab-content">
+      <h2 class="section-title">🎯 Practice Arena</h2>
+      <p style="color:var(--text2);margin-bottom:1.5rem;">Mixed exercises across all topics — DELE A2 exam style.</p>
+      <div class="practice-modes">
+        <div class="practice-mode-card" onclick="startPracticeMode('mixed')" style="border-color:rgba(245,200,66,0.3)">
+          <span class="mode-icon">🎲</span>
+          <h3>Mixed Practice</h3>
+          <p>Random questions from all topics</p>
+        </div>
+        <div class="practice-mode-card" onclick="startPracticeMode('exam')" style="border-color:rgba(232,72,90,0.3)">
+          <span class="mode-icon">📋</span>
+          <h3>Exam Simulation</h3>
+          <p>30-question DELE A2 mock test</p>
+        </div>
+        <div class="practice-mode-card" onclick="startPracticeMode('listening')" style="border-color:rgba(78,205,196,0.3)">
+          <span class="mode-icon">🎧</span>
+          <h3>Listening Practice</h3>
+          <p>Audio-based comprehension</p>
+        </div>
+        <div class="practice-mode-card" onclick="startPracticeMode('speaking')" style="border-color:rgba(34,197,94,0.3)">
+          <span class="mode-icon">🎤</span>
+          <h3>Speaking Practice</h3>
+          <p>Read aloud & pronunciation</p>
+        </div>
+        <div class="practice-mode-card" onclick="startPracticeMode('speed')" style="border-color:rgba(167,139,250,0.3)">
+          <span class="mode-icon">⚡</span>
+          <h3>Speed Round</h3>
+          <p>30 seconds per question!</p>
+        </div>
+        <div class="practice-mode-card" onclick="startPracticeMode('weak')" style="border-color:rgba(251,146,60,0.3)">
+          <span class="mode-icon">🔧</span>
+          <h3>Weak Spots</h3>
+          <p>Focus on your mistakes</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== ACHIEVEMENTS TAB ===== -->
+    <div id="tab-content-achievements" class="tab-content">
+      <h2 class="section-title">🥇 Achievements</h2>
+
+      <div class="section-label" style="margin-bottom:1rem;">🏆 Trophies</div>
+      <div class="trophy-display" id="trophyDisplay"></div>
+
+      <div class="section-label" style="margin-bottom:1rem;">🎖️ Badges</div>
+      <div class="badge-grid" id="badgeGrid"></div>
+    </div>
+
+    <!-- ===== PROGRESS TAB ===== -->
+    <div id="tab-content-progress" class="tab-content">
+      <h2 class="section-title">📊 Your Progress</h2>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="big-num" id="progXP" style="color:var(--accent)">0</span>
+          <span class="stat-name">Total XP</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="progLevel" style="color:var(--accent4)">1</span>
+          <span class="stat-name">Level</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="progQuestions" style="color:var(--accent3)">0</span>
+          <span class="stat-name">Questions</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="progAccuracy" style="color:var(--accent5)">—%</span>
+          <span class="stat-name">Accuracy</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="progStreak" style="color:var(--accent2)">0🔥</span>
+          <span class="stat-name">Streak</span>
+        </div>
+        <div class="stat-card">
+          <span class="big-num" id="progLessons" style="color:var(--success)">0</span>
+          <span class="stat-name">Lessons</span>
+        </div>
+      </div>
+
+      <div class="section-label">Skills Breakdown</div>
+      <div class="card" style="margin-bottom:1.5rem;" id="skillsBreakdown"></div>
+
+      <div class="section-label">7-Day Streak</div>
+      <div class="card">
+        <div class="streak-calendar" id="streakCalendar"></div>
+      </div>
+
+      <div style="height:1.5rem"></div>
+      <button class="btn btn-outline" onclick="resetProgress()" style="color:var(--danger);border-color:var(--danger)">🗑️ Reset Progress</button>
+    </div>
+
+  </main>
+</div>
+
+<!-- LESSON VIEW -->
+<div id="lessonView">
+  <div class="lesson-header">
+    <button class="lesson-close" onclick="closeLessonView()">✕</button>
+    <div class="lesson-progress-bar"><div class="lesson-progress-fill" id="lessonProgressFill" style="width:0%"></div></div>
+    <div class="lesson-xp-counter">⚡ <span id="lessonXpGained">0</span> XP</div>
+  </div>
+  <div class="lesson-body" id="lessonBody"></div>
+</div>
+
+<!-- FLASHCARD OVERLAY -->
+<div class="modal-overlay" id="flashcardOverlay">
+  <div class="modal" style="max-width:560px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+      <h2 id="flashcardTitle">Flashcards</h2>
+      <button class="btn btn-outline" onclick="closeFlashcards()" style="border-radius:50%;padding:0.5rem;width:36px;height:36px;display:flex;align-items:center;justify-content:center;">✕</button>
+    </div>
+    <div style="text-align:center;color:var(--text3);font-size:0.85rem;margin-bottom:1rem;" id="flashcardCounter">Card 1 of 20</div>
+    <div class="flashcard-container">
+      <div class="flashcard" id="mainFlashcard" onclick="flipCard()">
+        <div class="flashcard-face">
+          <div class="flashcard-category" id="fcCategory">Category</div>
+          <div class="flashcard-word" id="fcWord">Word</div>
+          <div class="flashcard-hint" style="margin-top:1rem">Tap to reveal translation →</div>
+        </div>
+        <div class="flashcard-face flashcard-back">
+          <div class="flashcard-translation" id="fcTranslation">Translation</div>
+          <div class="flashcard-example" id="fcExample">Example sentence</div>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:0.75rem;justify-content:center;margin-top:1rem;flex-wrap:wrap;">
+      <button class="btn" style="background:rgba(232,72,90,0.15);color:var(--accent2);border:1px solid rgba(232,72,90,0.3);" onclick="flashcardAnswer(false)">😕 Hard</button>
+      <button class="btn btn-outline" onclick="flashcardAnswer(null)">🤔 Okay</button>
+      <button class="btn" style="background:rgba(34,197,94,0.15);color:var(--success);border:1px solid rgba(34,197,94,0.3);" onclick="flashcardAnswer(true)">✅ Easy</button>
+    </div>
+    <div style="display:flex;gap:0.5rem;justify-content:center;margin-top:1rem;">
+      <button class="btn btn-outline" onclick="prevFlashcard()" style="padding:0.5rem 1rem;">← Prev</button>
+      <button class="btn btn-outline" onclick="nextFlashcard()" style="padding:0.5rem 1rem;">Next →</button>
+    </div>
+    <div style="margin-top:1rem;display:flex;justify-content:center;gap:0.5rem;flex-wrap:wrap;" id="fcAudio"></div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<!-- CONFETTI CONTAINER -->
+<div class="confetti" id="confettiContainer"></div>
+
+<script>
+// =========================================
+// DATA
+// =========================================
+
+const WORDS_OF_DAY = [
+  { word: "el mercado", type: "noun (m)", meaning: "the market", example: "Voy al mercado todos los sábados." },
+  { word: "tranquilo/a", type: "adjective", meaning: "calm, quiet", example: "El pueblo es muy tranquilo." },
+  { word: "sin embargo", type: "conjunction", meaning: "however, nevertheless", example: "Quiero ir, sin embargo estoy cansado." },
+  { word: "madrugar", type: "verb", meaning: "to get up early", example: "Tengo que madrugar mañana." },
+  { word: "el vecindario", type: "noun (m)", meaning: "the neighbourhood", example: "Mi vecindario es muy animado." },
+  { word: "a menudo", type: "adverb", meaning: "often", example: "A menudo como en casa." },
+  { word: "el semáforo", type: "noun (m)", meaning: "traffic light", example: "Para en el semáforo rojo." },
+  { word: "la madrugada", type: "noun (f)", meaning: "early morning / dawn", example: "Llegué a casa de madrugada." },
+  { word: "enseguida", type: "adverb", meaning: "right away, immediately", example: "Vengo enseguida." },
+  { word: "el paraguas", type: "noun (m)", meaning: "umbrella", example: "¿Tienes paraguas? Va a llover." },
+];
+
+const VOCABULARY = [
+  // Greetings & Social
+  { es:"hola", en:"hello", cat:"Greetings", example:"¡Hola! ¿Cómo estás?" },
+  { es:"buenos días", en:"good morning", cat:"Greetings", example:"Buenos días, señora García." },
+  { es:"buenas tardes", en:"good afternoon", cat:"Greetings", example:"Buenas tardes, ¿cómo está?" },
+  { es:"buenas noches", en:"good evening/night", cat:"Greetings", example:"Buenas noches a todos." },
+  { es:"¿cómo estás?", en:"how are you?", cat:"Greetings", example:"¡Hola! ¿Cómo estás?" },
+  { es:"¿qué tal?", en:"how's it going?", cat:"Greetings", example:"¿Qué tal el trabajo?" },
+  { es:"hasta luego", en:"goodbye (see you later)", cat:"Greetings", example:"¡Hasta luego y buen viaje!" },
+  { es:"hasta mañana", en:"see you tomorrow", cat:"Greetings", example:"Hasta mañana, que descanses." },
+  { es:"me llamo", en:"my name is", cat:"Greetings", example:"Me llamo María. ¿Y tú?" },
+  { es:"encantado/a", en:"pleased to meet you", cat:"Greetings", example:"Encantada de conocerte." },
+  // Family
+  { es:"la familia", en:"family", cat:"Family", example:"Mi familia es muy grande." },
+  { es:"los padres", en:"parents", cat:"Family", example:"Mis padres viven en Madrid." },
+  { es:"el padre", en:"father", cat:"Family", example:"Mi padre trabaja en un banco." },
+  { es:"la madre", en:"mother", cat:"Family", example:"Mi madre es médica." },
+  { es:"el hermano", en:"brother", cat:"Family", example:"Tengo un hermano mayor." },
+  { es:"la hermana", en:"sister", cat:"Family", example:"Mi hermana estudia en la universidad." },
+  { es:"el abuelo", en:"grandfather", cat:"Family", example:"Mi abuelo tiene 80 años." },
+  { es:"la abuela", en:"grandmother", cat:"Family", example:"Mi abuela cocina muy bien." },
+  { es:"el hijo", en:"son", cat:"Family", example:"Tienen dos hijos pequeños." },
+  { es:"la hija", en:"daughter", cat:"Family", example:"Su hija estudia medicina." },
+  { es:"los nietos", en:"grandchildren", cat:"Family", example:"Mis abuelos tienen cinco nietos." },
+  { es:"el marido/esposo", en:"husband", cat:"Family", example:"Su marido es muy simpático." },
+  { es:"la mujer/esposa", en:"wife", cat:"Family", example:"Su esposa trabaja en casa." },
+  // Food
+  { es:"el desayuno", en:"breakfast", cat:"Food", example:"Desayuno a las ocho." },
+  { es:"el almuerzo", en:"lunch", cat:"Food", example:"El almuerzo es a las dos." },
+  { es:"la cena", en:"dinner", cat:"Food", example:"Cenamos juntos en familia." },
+  { es:"el pan", en:"bread", cat:"Food", example:"Compro pan en la panadería." },
+  { es:"la leche", en:"milk", cat:"Food", example:"¿Quieres leche con el café?" },
+  { es:"el agua", en:"water", cat:"Food", example:"Bebo mucha agua cada día." },
+  { es:"la fruta", en:"fruit", cat:"Food", example:"Como fruta por la mañana." },
+  { es:"las verduras", en:"vegetables", cat:"Food", example:"Las verduras son muy sanas." },
+  { es:"la carne", en:"meat", cat:"Food", example:"No como mucha carne." },
+  { es:"el pescado", en:"fish", cat:"Food", example:"El pescado es muy saludable." },
+  { es:"el arroz", en:"rice", cat:"Food", example:"El arroz con leche es delicioso." },
+  { es:"la paella", en:"paella", cat:"Food", example:"La paella valenciana es típica." },
+  { es:"la tortilla", en:"omelette/tortilla", cat:"Food", example:"La tortilla española lleva patatas." },
+  { es:"el bocadillo", en:"sandwich", cat:"Food", example:"Como un bocadillo para comer." },
+  // Places
+  { es:"la ciudad", en:"city", cat:"Places", example:"Vivo en una ciudad grande." },
+  { es:"el pueblo", en:"town/village", cat:"Places", example:"Mi pueblo es muy tranquilo." },
+  { es:"la calle", en:"street", cat:"Places", example:"Vivo en la calle Mayor." },
+  { es:"la plaza", en:"square/plaza", cat:"Places", example:"La plaza del pueblo es preciosa." },
+  { es:"el supermercado", en:"supermarket", cat:"Places", example:"Voy al supermercado los viernes." },
+  { es:"la farmacia", en:"pharmacy", cat:"Places", example:"La farmacia está cerca de aquí." },
+  { es:"el hospital", en:"hospital", cat:"Places", example:"El hospital está lejos del centro." },
+  { es:"la estación de tren", en:"train station", cat:"Places", example:"La estación está a 10 minutos." },
+  { es:"el aeropuerto", en:"airport", cat:"Places", example:"El aeropuerto está fuera de la ciudad." },
+  { es:"la playa", en:"beach", cat:"Places", example:"En verano voy a la playa." },
+  { es:"el banco", en:"bank", cat:"Places", example:"Necesito ir al banco hoy." },
+  { es:"la biblioteca", en:"library", cat:"Places", example:"Estudio en la biblioteca." },
+  { es:"el restaurante", en:"restaurant", cat:"Places", example:"Reservamos mesa en el restaurante." },
+  // Transport
+  { es:"el autobús", en:"bus", cat:"Transport", example:"Tomo el autobús cada mañana." },
+  { es:"el metro", en:"metro/underground", cat:"Transport", example:"El metro es rápido y barato." },
+  { es:"el tren", en:"train", cat:"Transport", example:"El tren sale a las nueve." },
+  { es:"el avión", en:"airplane", cat:"Transport", example:"El avión llega a las doce." },
+  { es:"el taxi", en:"taxi", cat:"Transport", example:"Tomamos un taxi al hotel." },
+  { es:"el coche", en:"car", cat:"Transport", example:"Tenemos un coche nuevo." },
+  { es:"la bicicleta", en:"bicycle", cat:"Transport", example:"Voy al trabajo en bicicleta." },
+  { es:"a pie", en:"on foot", cat:"Transport", example:"Voy a la escuela a pie." },
+  // Time & Calendar
+  { es:"hoy", en:"today", cat:"Time", example:"Hoy tengo clase de español." },
+  { es:"mañana", en:"tomorrow", cat:"Time", example:"Mañana es lunes." },
+  { es:"ayer", en:"yesterday", cat:"Time", example:"Ayer fui al cine." },
+  { es:"la semana", en:"week", cat:"Time", example:"Esta semana trabajo mucho." },
+  { es:"el mes", en:"month", cat:"Time", example:"El mes de agosto es muy caluroso." },
+  { es:"el año", en:"year", cat:"Time", example:"Este año voy a España." },
+  { es:"lunes", en:"Monday", cat:"Time", example:"El lunes tengo reunión." },
+  { es:"martes", en:"Tuesday", cat:"Time", example:"Los martes voy al gimnasio." },
+  { es:"miércoles", en:"Wednesday", cat:"Time", example:"El miércoles hay clase." },
+  { es:"jueves", en:"Thursday", cat:"Time", example:"El jueves es mi día libre." },
+  { es:"viernes", en:"Friday", cat:"Time", example:"Los viernes salgo con amigos." },
+  { es:"sábado", en:"Saturday", cat:"Time", example:"El sábado descanso." },
+  { es:"domingo", en:"Sunday", cat:"Time", example:"El domingo como con la familia." },
+  // Adjectives
+  { es:"grande", en:"big/large", cat:"Adjectives", example:"Mi casa es muy grande." },
+  { es:"pequeño/a", en:"small/little", cat:"Adjectives", example:"Mi apartamento es pequeño." },
+  { es:"bonito/a", en:"pretty/nice", cat:"Adjectives", example:"¡Qué vestido tan bonito!" },
+  { es:"feo/a", en:"ugly", cat:"Adjectives", example:"El tiempo hoy es muy feo." },
+  { es:"nuevo/a", en:"new", cat:"Adjectives", example:"Tengo un trabajo nuevo." },
+  { es:"viejo/a", en:"old", cat:"Adjectives", example:"Esta es una ciudad muy vieja." },
+  { es:"barato/a", en:"cheap/inexpensive", cat:"Adjectives", example:"Este hotel es muy barato." },
+  { es:"caro/a", en:"expensive", cat:"Adjectives", example:"La ropa aquí es muy cara." },
+  { es:"simpático/a", en:"friendly/nice", cat:"Adjectives", example:"Su profesor es muy simpático." },
+  { es:"aburrido/a", en:"boring/bored", cat:"Adjectives", example:"La película es muy aburrida." },
+  { es:"interesante", en:"interesting", cat:"Adjectives", example:"Es un libro muy interesante." },
+  { es:"difícil", en:"difficult", cat:"Adjectives", example:"El examen es muy difícil." },
+  { es:"fácil", en:"easy", cat:"Adjectives", example:"Esta receta es muy fácil." },
+  { es:"cansado/a", en:"tired", cat:"Adjectives", example:"Estoy muy cansada hoy." },
+  // Verbs
+  { es:"hablar", en:"to speak/talk", cat:"Verbs", example:"Hablo español un poco." },
+  { es:"comer", en:"to eat", cat:"Verbs", example:"Comemos juntos a las dos." },
+  { es:"vivir", en:"to live", cat:"Verbs", example:"Vivo en el centro de la ciudad." },
+  { es:"querer", en:"to want/love", cat:"Verbs", example:"Quiero aprender español." },
+  { es:"poder", en:"to be able to/can", cat:"Verbs", example:"¿Puedes ayudarme, por favor?" },
+  { es:"tener", en:"to have", cat:"Verbs", example:"Tengo dos hermanos." },
+  { es:"ir", en:"to go", cat:"Verbs", example:"Voy al trabajo en metro." },
+  { es:"venir", en:"to come", cat:"Verbs", example:"¿Vienes a la fiesta mañana?" },
+  { es:"hacer", en:"to do/make", cat:"Verbs", example:"Hago deporte los fines de semana." },
+  { es:"decir", en:"to say/tell", cat:"Verbs", example:"¿Qué dices? No te escucho." },
+  { es:"ver", en:"to see/watch", cat:"Verbs", example:"Veo la televisión por la noche." },
+  { es:"saber", en:"to know (facts)", cat:"Verbs", example:"¿Sabes hablar francés?" },
+  { es:"conocer", en:"to know (people/places)", cat:"Verbs", example:"Conozco bien Madrid." },
+  { es:"gustar", en:"to like", cat:"Verbs", example:"Me gusta mucho el español." },
+  { es:"trabajar", en:"to work", cat:"Verbs", example:"Trabajo en una oficina." },
+  { es:"estudiar", en:"to study", cat:"Verbs", example:"Estudio español todos los días." },
+  { es:"llamarse", en:"to be called/named", cat:"Verbs", example:"Me llamo Ana." },
+  { es:"necesitar", en:"to need", cat:"Verbs", example:"Necesito ayuda, por favor." },
+  { es:"buscar", en:"to look for", cat:"Verbs", example:"Busco un apartamento." },
+  { es:"comprar", en:"to buy", cat:"Verbs", example:"Compro la comida en el mercado." },
+  // Numbers & Quantities
+  { es:"poco/a", en:"a little/few", cat:"Quantities", example:"Hablo un poco de español." },
+  { es:"mucho/a", en:"a lot/much", cat:"Quantities", example:"Tengo mucho trabajo hoy." },
+  { es:"bastante", en:"quite/enough", cat:"Quantities", example:"Hay bastante comida." },
+  { es:"demasiado/a", en:"too much", cat:"Quantities", example:"Hace demasiado calor." },
+  { es:"algo", en:"something", cat:"Quantities", example:"¿Quieres algo de beber?" },
+  { es:"nada", en:"nothing", cat:"Quantities", example:"No hay nada en el frigorífico." },
+  // Weather
+  { es:"el tiempo", en:"weather/time", cat:"Weather", example:"¿Qué tiempo hace hoy?" },
+  { es:"hace calor", en:"it's hot", cat:"Weather", example:"En verano hace mucho calor." },
+  { es:"hace frío", en:"it's cold", cat:"Weather", example:"En invierno hace mucho frío." },
+  { es:"llueve", en:"it's raining", cat:"Weather", example:"Hoy llueve mucho." },
+  { es:"hace sol", en:"it's sunny", cat:"Weather", example:"Hace sol y calor hoy." },
+  { es:"está nublado", en:"it's cloudy", cat:"Weather", example:"Hoy está muy nublado." },
+  { es:"nieva", en:"it's snowing", cat:"Weather", example:"En enero nieva mucho aquí." },
+];
+
+const TOPICS = [
+  { id:"greetings", icon:"👋", name:"Greetings & Introductions", desc:"Saludos y presentaciones", category:"Social", pill:"pill-vocab", exercises:12, xpPer:10 },
+  { id:"present", icon:"📅", name:"Present Tense", desc:"El presente de indicativo", category:"Grammar", pill:"pill-grammar", exercises:15, xpPer:12 },
+  { id:"ser-estar", icon:"🔄", name:"Ser vs Estar", desc:"The two verbs 'to be'", category:"Grammar", pill:"pill-grammar", exercises:14, xpPer:12 },
+  { id:"family", icon:"👨‍👩‍👧", name:"Family & Relationships", desc:"La familia y las relaciones", category:"Vocabulary", pill:"pill-vocab", exercises:10, xpPer:10 },
+  { id:"food", icon:"🍽️", name:"Food & Restaurants", desc:"Comida y restaurantes", category:"Vocabulary", pill:"pill-vocab", exercises:12, xpPer:10 },
+  { id:"preterite", icon:"⏮️", name:"Preterite Tense", desc:"El pretérito indefinido", category:"Grammar", pill:"pill-grammar", exercises:16, xpPer:15 },
+  { id:"imperfect", icon:"🔙", name:"Imperfect Tense", desc:"El pretérito imperfecto", category:"Grammar", pill:"pill-grammar", exercises:14, xpPer:15 },
+  { id:"future", icon:"🔮", name:"Future Tense", desc:"El futuro simple", category:"Grammar", pill:"pill-grammar", exercises:12, xpPer:12 },
+  { id:"reflexive", icon:"🪞", name:"Reflexive Verbs", desc:"Los verbos reflexivos", category:"Grammar", pill:"pill-grammar", exercises:12, xpPer:12 },
+  { id:"places", icon:"🗺️", name:"Places & Directions", desc:"Lugares y direcciones", category:"Vocabulary", pill:"pill-vocab", exercises:10, xpPer:10 },
+  { id:"transport", icon:"🚌", name:"Transport & Travel", desc:"Transporte y viajes", category:"Vocabulary", pill:"pill-vocab", exercises:10, xpPer:10 },
+  { id:"shopping", icon:"🛍️", name:"Shopping", desc:"De compras", category:"Vocabulary", pill:"pill-vocab", exercises:10, xpPer:10 },
+  { id:"health", icon:"🏥", name:"Health & Body", desc:"La salud y el cuerpo", category:"Vocabulary", pill:"pill-vocab", exercises:10, xpPer:10 },
+  { id:"weather", icon:"☀️", name:"Weather & Seasons", desc:"El tiempo y las estaciones", category:"Vocabulary", pill:"pill-vocab", exercises:8, xpPer:10 },
+  { id:"work", icon:"💼", name:"Work & Studies", desc:"El trabajo y los estudios", category:"Vocabulary", pill:"pill-vocab", exercises:10, xpPer:10 },
+  { id:"subjunctive", icon:"🎭", name:"Subjunctive (Intro)", desc:"El subjuntivo presente", category:"Grammar", pill:"pill-grammar", exercises:12, xpPer:18 },
+  { id:"pronouns", icon:"👤", name:"Pronouns", desc:"Los pronombres", category:"Grammar", pill:"pill-grammar", exercises:14, xpPer:12 },
+  { id:"numbers", icon:"🔢", name:"Numbers & Quantities", desc:"Números y cantidades", category:"Vocabulary", pill:"pill-vocab", exercises:8, xpPer:8 },
+  { id:"culture", icon:"🎨", name:"Spanish Culture", desc:"Cultura hispana", category:"Culture", pill:"pill-culture", exercises:8, xpPer:15 },
+  { id:"reading", icon:"📖", name:"Reading Comprehension", desc:"Comprensión lectora", category:"Skills", pill:"pill-skill", exercises:10, xpPer:15 },
+];
+
+const BADGES = [
+  { id:"first_lesson", icon:"🌱", name:"First Steps", desc:"Complete your first lesson", condition: s => s.lessonsCompleted >= 1 },
+  { id:"week_streak", icon:"🔥", name:"On Fire", desc:"7-day streak", condition: s => s.streak >= 7 },
+  { id:"vocab_50", icon:"📚", name:"Word Collector", desc:"Learn 50 vocabulary words", condition: s => s.wordsLearned >= 50 },
+  { id:"vocab_100", icon:"📖", name:"Word Hoarder", desc:"Learn 100 vocabulary words", condition: s => s.wordsLearned >= 100 },
+  { id:"xp_500", icon:"⚡", name:"XP Surge", desc:"Earn 500 XP total", condition: s => s.xp >= 500 },
+  { id:"xp_1000", icon:"💥", name:"XP Explosion", desc:"Earn 1000 XP total", condition: s => s.xp >= 1000 },
+  { id:"perfect_lesson", icon:"💎", name:"Perfectionist", desc:"Complete a lesson with 100% accuracy", condition: s => s.perfectLessons >= 1 },
+  { id:"lessons_5", icon:"📝", name:"Dedicated", desc:"Complete 5 lessons", condition: s => s.lessonsCompleted >= 5 },
+  { id:"lessons_10", icon:"🎓", name:"Scholar", desc:"Complete 10 lessons", condition: s => s.lessonsCompleted >= 10 },
+  { id:"daily_challenge", icon:"🎯", name:"Daily Hero", desc:"Complete a daily challenge", condition: s => s.dailyChallenges >= 1 },
+  { id:"accuracy_90", icon:"🏹", name:"Sharp Shooter", desc:"90%+ accuracy in a session", condition: s => s.bestAccuracy >= 90 },
+  { id:"all_topics", icon:"🌟", name:"Renaissance", desc:"Start every topic module", condition: s => s.topicsStarted >= TOPICS.length },
+  { id:"night_owl", icon:"🦉", name:"Night Owl", desc:"Study after 10 PM", condition: s => s.nightSessions >= 1 },
+  { id:"speed_demon", icon:"⚡", name:"Speed Demon", desc:"Complete a speed round", condition: s => s.speedRounds >= 1 },
+  { id:"month_streak", icon:"🏅", name:"Iron Will", desc:"30-day streak", condition: s => s.streak >= 30 },
+  { id:"xp_5000", icon:"👑", name:"XP Royalty", desc:"Earn 5000 XP total", condition: s => s.xp >= 5000 },
+];
+
+const TROPHIES = [
+  { id:"beginner", icon:"🥉", name:"Principiante", req:"Reach Level 5", check: s => s.level >= 5 },
+  { id:"intermediate", icon:"🥈", name:"Estudiante", req:"Reach Level 10", check: s => s.level >= 10 },
+  { id:"advanced", icon:"🥇", name:"Aventajado", req:"Reach Level 15", check: s => s.level >= 15 },
+  { id:"master", icon:"🏆", name:"Maestro", req:"Complete all topics", check: s => s.topicsCompleted >= TOPICS.length },
+  { id:"dele", icon:"🎖️", name:"DELE Ready", req:"Earn 10,000 XP", check: s => s.xp >= 10000 },
+];
+
+// =========================================
+// EXERCISE GENERATION ENGINE
+// =========================================
+
+function generateExercises(topicId, count = 8) {
+  const pool = getExercisePool(topicId);
+  const shuffled = pool.sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, Math.min(count, shuffled.length));
+}
+
+function getExercisePool(topicId) {
+  const exercises = [];
+
+  if (topicId === 'greetings') {
+    exercises.push(
+      mkMC("¿Cómo se dice 'How are you?' en español?", ["¿Cómo estás?","¿Dónde estás?","¿Quién eres?","¿Qué haces?"], 0, "¿Cómo estás? is used for informal 'how are you?'. ¿Cómo está usted? is formal.", "easy"),
+      mkMC("¿Cuál es la respuesta correcta a '¿Cómo estás?'", ["Muy bien, gracias","Buenos días","Hasta luego","Me llamo Ana"], 0, "'Muy bien, gracias' = Very well, thank you — the standard polite response.", "easy"),
+      mkFill("___ días, señor García.", ["Buenos"], "Complete the formal morning greeting.", "easy"),
+      mkFill("Me ___ Ana. ¿Y tú?", ["llamo"], "Use the verb llamarse (to be called).", "easy"),
+      mkMC("'Hasta luego' significa:", ["See you later","Good morning","Thank you","Please"], 0, "Hasta luego = until later = see you later.", "easy"),
+      mkMC("¿Cuál de estas es una despedida (goodbye)?", ["Adiós","Hola","Buenos días","¿Cómo estás?"], 0, "Adiós and hasta luego are goodbyes.", "easy"),
+      mkTranslate("Good evening / Good night", "Buenas noches", "Used from evening onwards.", "easy"),
+      mkTranslate("Nice to meet you (f)", "Encantada", "Encantado (m) / Encantada (f).", "easy"),
+      mkWordOrder(["Me","llamo","Sofía","."], "Me llamo Sofía.", "Subject + llamarse verb + name", "easy"),
+      mkMC("¿Cómo se saluda de forma informal?", ["¡Hola!","Buenos días, señor","Buenas tardes","Mucho gusto"], 0, "Hola is the casual, informal greeting.", "easy"),
+      mkFill("Buenas ___, son las tres de la tarde.", ["tardes"], "Buenas tardes is used from midday to evening.", "easy"),
+      mkMC("'¿Qué tal?' es equivalente a:", ["How's it going?","What is it?","Where are you?","Who are you?"], 0, "¿Qué tal? = How's it going? A colloquial greeting.", "medium"),
+    );
+  } else if (topicId === 'present') {
+    exercises.push(
+      mkMC("¿Cuál es la forma correcta de 'hablar' con 'yo'?", ["hablo","hablas","habla","hablamos"], 0, "Yo hablo — regular -AR verb: yo → -o ending.", "easy"),
+      mkMC("¿Cuál es la forma de 'comer' con 'nosotros'?", ["comemos","comen","come","comes"], 0, "Nosotros comemos — -ER verb: nosotros → -emos ending.", "easy"),
+      mkFill("Ella ___ (vivir) en Barcelona.", ["vive"], "Ella vive — regular -IR verb: ella → -e ending.", "easy"),
+      mkFill("Vosotros ___ (estudiar) mucho.", ["estudiáis"], "Vosotros + -AR verb → -áis ending. Note the accent.", "medium"),
+      mkMC("'Yo tengo' es la forma irregular de:", ["tener","temer","tender","tesar"], 0, "Tener (to have) is irregular: yo tengo.", "medium"),
+      mkFill("Ella ___ (ir) al mercado.", ["va"], "Ir is highly irregular. Ella va = She goes.", "medium"),
+      mkTranslate("We speak Spanish every day.", "Hablamos español todos los días.", "Nosotros hablamos — regular present.", "easy"),
+      mkWordOrder(["Tú","comes","una","manzana","."], "Tú comes una manzana.", "Subject + verb + object", "easy"),
+      mkMC("'Ellos tienen' — ¿a qué verbo pertenece?", ["tener","venir","ver","temer"], 0, "Ellos tienen = they have. Tener = to have.", "easy"),
+      mkFill("Yo ___ (ser) estudiante de español.", ["soy"], "Ser is irregular: yo soy.", "easy"),
+      mkFill("¿Tú ___ (querer) un café?", ["quieres"], "Querer is a stem-changing verb (e→ie). Tú quieres.", "medium"),
+      mkFill("Nosotros ___ (poder) venir mañana.", ["podemos"], "Poder: nosotros podemos — no stem change in nosotros.", "medium"),
+      mkMC("¿Cuál NO es un verbo regular en -AR?", ["ir","hablar","trabajar","estudiar"], 0, "Ir (to go) is one of the most irregular verbs.", "medium"),
+      mkTranslate("She is able to / She can help.", "Ella puede ayudar.", "Poder = to be able to / can.", "medium"),
+      mkWordOrder(["Vosotros","vivís","en","Madrid","."], "Vosotros vivís en Madrid.", "Regular -IR with vosotros: -ís ending.", "medium"),
+    );
+  } else if (topicId === 'ser-estar') {
+    exercises.push(
+      mkMC("'Soy profesora.' — ¿Por qué usamos SER?", ["Profesión/ocupación","Ubicación","Estado temporal","Sentimiento"], 0, "SER is used for professions, permanent identity.", "easy"),
+      mkMC("'Estoy cansada.' — ¿Por qué usamos ESTAR?", ["Estado temporal","Origen","Profesión","Descripción permanente"], 0, "ESTAR is used for temporary states/feelings.", "easy"),
+      mkFill("Madrid ___ en España.", ["está"], "Location of places (non-events) uses ESTAR.", "medium"),
+      mkFill("Ella ___ muy inteligente.", ["es"], "Permanent characteristics use SER.", "easy"),
+      mkMC("¿Cuál es correcto? 'La sopa ___.'", ["está caliente","es caliente","es fría ahora","soy caliente"], 0, "Temperature of things = temporary state = ESTAR.", "medium"),
+      mkFill("Hoy yo ___ de buen humor.", ["estoy"], "Mood/feelings use ESTAR.", "easy"),
+      mkMC("'El libro es de María.' SER se usa aquí para:", ["Posesión","Estado","Ubicación","Temperatura"], 0, "SER + de = possession.", "medium"),
+      mkTranslate("The door is open. (temporary state)", "La puerta está abierta.", "Abierta = open. Temporary state = ESTAR.", "medium"),
+      mkMC("¿Cuál es incorrecto?", ["Soy cansado (temporary)","Soy médico","Es de España","Está en casa"], 0, "Cansado (tired) is a temporary state → use ESTAR, not SER.", "hard"),
+      mkFill("¿De dónde ___ tú?", ["eres"], "Origin uses SER.", "easy"),
+      mkMC("'La boda es en el jardín.' ¿Por qué SER?", ["Evento/celebración","Estado","Temperatura","Posesión"], 0, "Events take SER (not ESTAR) for location.", "hard"),
+      mkFill("Ellos ___ felices hoy.", ["están"], "Feelings = ESTAR. Felices = happy.", "easy"),
+      mkFill("Mi madre ___ alta y rubia.", ["es"], "Physical descriptions = SER.", "easy"),
+      mkTranslate("We are in the library.", "Estamos en la biblioteca.", "Location of people = ESTAR.", "easy"),
+    );
+  } else if (topicId === 'family') {
+    exercises.push(
+      mkMC("¿Cómo se dice 'grandmother' en español?", ["la abuela","la madre","la tía","la hermana"], 0, "La abuela = grandmother.", "easy"),
+      mkFill("El hijo de mi tío es mi ___.", ["primo"], "Primo/prima = cousin.", "medium"),
+      mkMC("¿Cuál significa 'siblings'?", ["los hermanos","los padres","los hijos","los abuelos"], 0, "Los hermanos = brothers/siblings.", "easy"),
+      mkTranslate("My parents have three children.", "Mis padres tienen tres hijos.", "Padres = parents, hijos = children.", "easy"),
+      mkMC("'Mi nuera' means:", ["my daughter-in-law","my sister-in-law","my mother-in-law","my stepdaughter"], 0, "Nuera = daughter-in-law.", "hard"),
+      mkFill("La hermana de mi madre es mi ___.", ["tía"], "Tía = aunt.", "easy"),
+      mkWordOrder(["Tengo","dos","hermanos","y","una","hermana","."], "Tengo dos hermanos y una hermana.", "tengo + number + noun", "easy"),
+      mkMC("¿Cómo se dice 'stepfather'?", ["el padrastro","el padrino","el abuelo","el suegro"], 0, "Padrastro = stepfather.", "medium"),
+      mkFill("Los hijos de mis hijos son mis ___.", ["nietos"], "Nietos = grandchildren.", "medium"),
+      mkTranslate("She is my younger sister.", "Ella es mi hermana menor.", "Menor = younger.", "medium"),
+    );
+  } else if (topicId === 'food') {
+    exercises.push(
+      mkMC("En un restaurante, ¿qué pides para conocer el menú?", ["la carta","la cuenta","el postre","el vaso"], 0, "La carta = the menu.", "easy"),
+      mkFill("¿Me puede traer la ___, por favor? (the bill)", ["cuenta"], "La cuenta = the bill.", "easy"),
+      mkMC("'Estoy lleno/a' significa:", ["I'm full","I'm hungry","I'm thirsty","I'm satisfied overall"], 0, "Lleno/a = full (as in, eaten enough).", "easy"),
+      mkTranslate("I would like a glass of water, please.", "Quisiera un vaso de agua, por favor.", "Quisiera = polite 'I would like'.", "medium"),
+      mkFill("La tortilla española lleva ___ y huevos.", ["patatas"], "Patatas = potatoes. La tortilla española.", "easy"),
+      mkMC("¿Qué es la 'paella'?", ["Un plato de arroz con mariscos/carne","Un postre dulce","Una sopa de verduras","Un bocadillo típico"], 0, "Paella is rice cooked with seafood/meat.", "easy"),
+      mkWordOrder(["Quiero","pedir","el","menú","del","día","."], "Quiero pedir el menú del día.", "Querer + infinitive structure.", "easy"),
+      mkMC("¿Cómo se llama 'breakfast' en español?", ["el desayuno","el almuerzo","la merienda","la cena"], 0, "El desayuno = breakfast.", "easy"),
+      mkFill("De ___ quiero una ensalada. (for starter)", ["primero"], "De primero = for the starter/first course.", "medium"),
+      mkTranslate("The food is very tasty here.", "La comida está muy rica aquí.", "Rica/deliciosa = tasty.", "easy"),
+      mkMC("'¿Está incluido el servicio?' means:", ["Is service included?","Is the waiter here?","Is the food ready?","Is the restaurant open?"], 0, "Included service = propina incluida.", "medium"),
+      mkFill("Para beber, quisiera un ___ de naranja.", ["zumo"], "Zumo (Spain) = juice.", "medium"),
+    );
+  } else if (topicId === 'preterite') {
+    exercises.push(
+      mkMC("¿Cuál es la forma de 'hablar' en pretérito con 'yo'?", ["hablé","habló","hablaste","hablamos"], 0, "Yo hablé — pretérito indefinido -AR: yo → -é.", "easy"),
+      mkFill("Ayer ella ___ (comer) en un restaurante.", ["comió"], "Comer pretérito: ella comió.", "easy"),
+      mkMC("'Fui' es la forma irregular de:", ["ir/ser","ver","tener","hacer"], 0, "Fui = I went (ir) OR I was (ser) — same irregular form!", "medium"),
+      mkFill("Nosotros ___ (vivir) en Madrid dos años.", ["vivimos"], "Vivir pretérito: nosotros vivimos — same as present! Context decides.", "hard"),
+      mkTranslate("She called me yesterday.", "Ella me llamó ayer.", "Llamar → llamó (él/ella).", "easy"),
+      mkMC("'¿Qué hiciste ayer?' — 'hacer' es irregular. ¿Cuál es correcto con 'yo'?", ["hice","hacé","hací","hació"], 0, "Hacer pretérito: yo hice.", "medium"),
+      mkFill("El tren ___ (llegar) tarde.", ["llegó"], "Llegar → llegó (él/ella).", "easy"),
+      mkWordOrder(["Ayer","fui","al","cine","con","mis","amigos","."], "Ayer fui al cine con mis amigos.", "Time marker + verb + place/with", "easy"),
+      mkMC("'Tuve' es el pretérito de:", ["tener","ver","decir","venir"], 0, "Tener pretérito: yo tuve.", "medium"),
+      mkFill("¿___ (tú - ver) la película anoche?", ["Viste"], "Ver pretérito tú: viste.", "medium"),
+      mkTranslate("We arrived very late.", "Llegamos muy tarde.", "Llegar pretérito nosotros: llegamos.", "easy"),
+      mkMC("El marcador temporal del pretérito es:", ["ayer","mañana","siempre","normalmente"], 0, "Ayer (yesterday) triggers the preterite.", "easy"),
+      mkFill("Él ___ (decir) la verdad.", ["dijo"], "Decir pretérito: dijo (irregular).", "hard"),
+      mkFill("Vosotros ___ (salir) tarde anoche.", ["salisteis"], "Salir pretérito vosotros: salisteis.", "hard"),
+      mkTranslate("I was in Spain last summer.", "Estuve en España el verano pasado.", "Estar pretérito: yo estuve.", "medium"),
+      mkMC("¿Cuál es el marcador del pretérito?", ["la semana pasada","todos los días","a veces","generalmente"], 0, "La semana pasada = last week → preterite.", "medium"),
+    );
+  } else if (topicId === 'imperfect') {
+    exercises.push(
+      mkMC("El imperfecto se usa para:", ["Acciones habituales en el pasado","Acciones puntuales en el pasado","El futuro","Mandatos"], 0, "Imperfect = habitual past actions, descriptions, background.", "easy"),
+      mkFill("Cuando era niña, ___ (jugar) mucho.", ["jugaba"], "Jugar imperfecto: jugaba (yo).", "medium"),
+      mkMC("¿Cuál es la forma del imperfecto de 'ser' con 'yo'?", ["era","fui","soy","seré"], 0, "Ser imperfecto: yo era (irregular).", "medium"),
+      mkFill("De pequeño, él ___ (vivir) en el campo.", ["vivía"], "Vivir imperfecto: vivía.", "easy"),
+      mkTranslate("She used to work every day.", "Ella trabajaba todos los días.", "Trabajar imperfecto: trabajaba.", "easy"),
+      mkMC("'Iba' es el imperfecto de:", ["ir","tener","ser","ver"], 0, "Ir imperfecto: yo iba (irregular).", "medium"),
+      mkFill("Nosotros ___ (tener) un perro cuando éramos jóvenes.", ["teníamos"], "Tener imperfecto: teníamos.", "medium"),
+      mkWordOrder(["Antes","siempre","comíamos","juntos","."], "Antes siempre comíamos juntos.", "Time marker (antes) with imperfect.", "medium"),
+      mkMC("'Veía' es el imperfecto de:", ["ver","venir","volar","valer"], 0, "Ver imperfecto: veía. Irregular.", "medium"),
+      mkTranslate("Every summer we went to the beach.", "Todos los veranos íbamos a la playa.", "Ir imperfecto: íbamos.", "medium"),
+      mkFill("Cuando ___ (haber) dinero, viajábamos.", ["había"], "Haber imperfecto: había (impersonal).", "hard"),
+      mkMC("¿Cuál marcador temporal sugiere el imperfecto?", ["cada día","ayer","el año pasado","esta mañana"], 0, "Cada día (every day) = habitual = imperfect.", "easy"),
+      mkFill("Ellos ___ (ser) muy jóvenes entonces.", ["eran"], "Ser imperfecto: eran.", "easy"),
+      mkTranslate("It was raining when I arrived.", "Llovía cuando llegué.", "Background (imperfect) + event (preterite).", "hard"),
+    );
+  } else if (topicId === 'future') {
+    exercises.push(
+      mkMC("'Hablaré' es la forma futura de 'yo' de:", ["hablar","haber","habitual","habitar"], 0, "Hablar futuro: yo hablaré.", "easy"),
+      mkFill("Mañana ___ (comer, yo) en casa.", ["comeré"], "Comer futuro: yo comeré.", "easy"),
+      mkMC("¿Cuál es el futuro de 'tener' con 'yo'?", ["tendré","teneré","tenga","tengo"], 0, "Tener futuro irregular: tendré.", "medium"),
+      mkTranslate("We will travel to Spain next year.", "Viajaremos a España el año que viene.", "Viajar futuro: viajaremos.", "easy"),
+      mkFill("Ella ___ (venir) mañana seguro.", ["vendrá"], "Venir futuro irregular: vendrá.", "medium"),
+      mkMC("'Iré' es el futuro de:", ["ir","irme","irritar","ilusionar"], 0, "Ir futuro: iré.", "easy"),
+      mkWordOrder(["El","año","que","viene","viviremos","en","París","."], "El año que viene viviremos en París.", "Future time marker + future tense.", "medium"),
+      mkFill("¿Qué ___ (hacer, tú) este fin de semana?", ["harás"], "Hacer futuro irregular: harás.", "medium"),
+      mkTranslate("They will not come to the party.", "No vendrán a la fiesta.", "Venir futuro: vendrán. Negation: no.", "medium"),
+      mkMC("El futuro también expresa:", ["Suposición/probabilidad","Solo acciones planificadas","El pasado","Estados permanentes"], 0, "Future can express probability: Estará en casa = He's probably home.", "hard"),
+      mkFill("Vosotros ___ (saber) la respuesta mañana.", ["sabréis"], "Saber futuro irregular: sabréis.", "hard"),
+      mkTranslate("I will have to study more.", "Tendré que estudiar más.", "Tener que + infinitive in future.", "medium"),
+    );
+  } else if (topicId === 'reflexive') {
+    exercises.push(
+      mkMC("¿Cuál es el pronombre reflexivo para 'yo'?", ["me","te","se","nos"], 0, "Yo → me (reflexive pronoun).", "easy"),
+      mkFill("Ella ___ (llamarse) Lucía.", ["se llama"], "Llamarse: ella se llama.", "easy"),
+      mkMC("'Me levanto a las siete' — 'levantarse' es reflexivo porque:", ["El sujeto hace y recibe la acción","Es un verbo -AR","Tiene pronombre","Siempre es reflexivo"], 0, "Reflexive = subject performs action on itself.", "medium"),
+      mkFill("Nosotros ___ (lavarse) las manos.", ["nos lavamos"], "Lavarse: nosotros nos lavamos.", "medium"),
+      mkTranslate("I get dressed in the morning.", "Me visto por las mañanas.", "Vestirse (e→i) + reflexive: me visto.", "medium"),
+      mkMC("¿Cuál es reflexivo?", ["ducharse","comer","hablar","leer"], 0, "Ducharse (to shower) = reflexive.", "easy"),
+      mkFill("¿A qué hora ___ (tú - acostarse)?", ["te acuestas"], "Acostarse (o→ue): tú te acuestas.", "hard"),
+      mkWordOrder(["Me","ducho","cada","mañana","antes","del","desayuno","."], "Me ducho cada mañana antes del desayuno.", "Reflexive + time expression.", "medium"),
+      mkTranslate("They feel very happy.", "Se sienten muy felices.", "Sentirse (e→ie): se sienten.", "medium"),
+      mkMC("'Se peina' — ¿quién realiza la acción?", ["Él/Ella se peina a sí mismo/a","Alguien más lo peina","Un peluquero","Nadie"], 0, "Reflexive = the subject does it to themselves.", "easy"),
+      mkFill("Vosotros ___ (quedarse) en casa hoy.", ["os quedáis"], "Quedarse: vosotros os quedáis.", "hard"),
+      mkTranslate("I have to get up early tomorrow.", "Tengo que levantarme temprano mañana.", "Tener que + infinitive + reflexive.", "hard"),
+    );
+  } else if (topicId === 'places') {
+    exercises.push(
+      mkMC("¿Cómo se dice 'turn left'?", ["girar a la izquierda","girar a la derecha","seguir recto","cruzar"],0,"Izquierda = left, derecha = right.","easy"),
+      mkFill("Para ir al hospital, ___ recto dos calles.", ["siga/sigue"],"Seguir recto = go straight.","easy"),
+      mkMC("'¿Dónde está la estación?' — ¿Qué verbo usamos para preguntar por ubicación?", ["estar","ser","haber","tener"],0,"ESTAR is used for location of people and things.","easy"),
+      mkMC("'Está al lado del banco' significa:", ["It's next to the bank","It's in front of the bank","It's behind the bank","It's far from the bank"],0,"Al lado de = next to.","easy"),
+      mkFill("El supermercado está ___ la farmacia. (in front of)", ["enfrente de","delante de"],"Enfrente de / delante de = in front of.","medium"),
+      mkTranslate("The hotel is between the museum and the park.", "El hotel está entre el museo y el parque.","Entre = between.","medium"),
+      mkMC("¿Qué significa 'al fondo'?", ["At the end/back","On the left","Upstairs","Nearby"],0,"Al fondo = at the back/end.","medium"),
+      mkFill("Perdone, ¿___ decirme dónde está el banco?", ["puede","podría"],"Polite request with poder: puede (can you) or podría (could you).","medium"),
+      mkWordOrder(["Gire","a","la","derecha","y","tome","la","primera","calle","."],"Gire a la derecha y tome la primera calle.","Direction instruction.","medium"),
+      mkTranslate("Is it far from here?","¿Está lejos de aquí?","Lejos = far, cerca = near.","easy"),
+    );
+  } else if (topicId === 'weather') {
+    exercises.push(
+      mkMC("'Hace calor' significa:", ["It's hot","It's cold","It's windy","It's cloudy"],0,"Hacer calor = to be hot (weather).","easy"),
+      mkFill("Hoy ___ mucho. Necesito un paraguas.", ["llueve"],"Llover (o→ue): llueve = it's raining.","easy"),
+      mkTranslate("It's sunny and warm today.","Hoy hace sol y calor.","Hacer sol = to be sunny.","easy"),
+      mkMC("'Está nublado' significa:", ["It's cloudy","It's foggy","It's windy","It's stormy"],0,"Nublado = cloudy.","easy"),
+      mkFill("En invierno ___ mucho en las montañas.", ["nieva"],"Nevar (e→ie): nieva = it snows.","medium"),
+      mkMC("¿Cómo se dice 'What's the weather like?'", ["¿Qué tiempo hace?","¿Cómo está el tiempo?","¿Hace buen tiempo?","Todas son correctas"],3,"All three are valid ways to ask about the weather!","medium"),
+      mkWordOrder(["Mañana","hará","frío","y","lloverá","."],"Mañana hará frío y lloverá.","Future weather prediction.","medium"),
+      mkTranslate("It was very foggy this morning.","Esta mañana había mucha niebla.","Niebla = fog, había = there was (imperfect).","hard"),
+      mkFill("Hace ___ grados hoy. (30)", ["treinta"],"Temperature: hace X grados.","easy"),
+      mkMC("'Está lloviendo' es el presente continuo de:", ["llover","nieve","tiempo","lluvia"],0,"Estar + gerundio: está lloviendo.","medium"),
+    );
+  } else if (topicId === 'numbers') {
+    exercises.push(
+      mkMC("¿Cómo se escribe '21' en español?", ["veintiuno","veinte y uno","veinte uno","veinteún"],0,"21 = veintiuno (one word).","easy"),
+      mkFill("___ (1000) personas viven aquí.", ["Mil"],"1000 = mil.","easy"),
+      mkTranslate("I have thirty-five euros.","Tengo treinta y cinco euros.","35 = treinta y cinco.","easy"),
+      mkMC("¿Cuánto es 'un millón'?", ["1,000,000","100,000","10,000","1,000"],0,"Un millón = one million.","easy"),
+      mkFill("Son las tres y ___ (15 min).", ["cuarto"],"Las tres y cuarto = 3:15.","medium"),
+      mkMC("¿Cómo se dice 'half past two'?", ["las dos y media","las dos y cuarto","las tres menos cuarto","las dos en punto"],0,"Y media = half past.","easy"),
+      mkTranslate("The shop closes at a quarter to nine.","La tienda cierra a las nueve menos cuarto.","Menos cuarto = quarter to.","medium"),
+      mkFill("En total son doscientos ___ euros. (250)", ["cincuenta"],"250 = doscientos cincuenta.","medium"),
+      mkMC("¿Cómo se dice 'both'?", ["ambos/las dos","todos","varios","ninguno"],0,"Ambos / los dos / las dos = both.","medium"),
+      mkFill("El siglo ___ (21st) en español es 'el siglo veintiuno'.", ["XXI"],"Ordinals are used for centuries.","medium"),
+    );
+  } else {
+    // Generic mixed exercises for other topics
+    const relVocab = VOCABULARY.filter(v => {
+      if (topicId === 'transport') return v.cat === 'Transport';
+      if (topicId === 'food') return v.cat === 'Food';
+      if (topicId === 'places') return v.cat === 'Places';
+      if (topicId === 'family') return v.cat === 'Family';
+      return true;
+    });
+    const sample = relVocab.sort(() => Math.random() - 0.5).slice(0, 8);
+    sample.forEach(v => {
+      exercises.push(mkMC(`¿Cómo se dice '${v.en}' en español?`,
+        shuffleOptions(v.es, VOCABULARY.filter(x=>x!==v).map(x=>x.es)), 0,
+        `${v.es} = ${v.en}. ${v.example}`, "easy"));
+      if (Math.random() > 0.5) {
+        exercises.push(mkTranslate(v.en, v.es, v.example, "easy"));
+      }
+    });
+    // Add some general grammar fillers
+    exercises.push(
+      mkMC("¿Cuál es el artículo definido para 'libro' (m)?", ["el","la","los","las"],0,"Masculine singular = el.","easy"),
+      mkMC("¿Cuál es el artículo indefinido para 'casa' (f)?", ["una","un","unas","unos"],0,"Feminine singular = una.","easy"),
+      mkFill("Hay ___ (many) personas en la plaza.", ["muchas"],"Muchas agrees with personas (f.pl.).","easy"),
+    );
+  }
+
+  return exercises.filter(e => e && e.type);
+}
+
+function shuffleOptions(correct, pool) {
+  const opts = [correct, ...pool.sort(()=>Math.random()-0.5).slice(0,3)];
+  return opts.sort(()=>Math.random()-0.5);
+}
+
+// Exercise makers
+function mkMC(q, opts, ans, exp, diff) {
+  return { type:'mc', question:q, options:opts, answer:ans, explanation:exp, difficulty:diff };
+}
+function mkFill(q, ans, exp, diff) {
+  return { type:'fill', question:q, answer:Array.isArray(ans)?ans:[ans], explanation:exp, difficulty:diff };
+}
+function mkTranslate(q, ans, exp, diff) {
+  return { type:'translate', question:q, answer:ans, explanation:exp, difficulty:diff };
+}
+function mkWordOrder(words, ans, exp, diff) {
+  return { type:'wordorder', words:words, answer:ans, explanation:exp, difficulty:diff };
+}
+
+// =========================================
+// GRAMMAR CONTENT
+// =========================================
+
+const GRAMMAR_DATA = [
+  {
+    title: "Articles: Definite & Indefinite",
+    icon: "📌",
+    sections: [
+      {
+        rule: `Spanish has four definite articles: <code>el</code> (m.sg.), <code>la</code> (f.sg.), <code>los</code> (m.pl.), <code>las</code> (f.pl.). And four indefinite: <code>un</code>, <code>una</code>, <code>unos</code>, <code>unas</code>.`,
+        examples: [
+          { es: "El libro es interesante.", en: "The book is interesting." },
+          { es: "La casa tiene tres habitaciones.", en: "The house has three rooms." },
+          { es: "Tengo un hermano y una hermana.", en: "I have a brother and a sister." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Present Tense (Indicativo)",
+    icon: "📅",
+    sections: [
+      {
+        rule: `Regular verbs follow three patterns based on their infinitive ending: <code>-AR</code>, <code>-ER</code>, <code>-IR</code>. Stem-changing verbs (e→ie, o→ue, e→i) change in all forms except nosotros/vosotros.`,
+        examples: [
+          { es: "Yo hablo, tú hablas, él habla...", en: "I speak, you speak, he speaks..." },
+          { es: "Quiero café. (querer: e→ie)", en: "I want coffee." },
+          { es: "¿Puedes ayudarme? (poder: o→ue)", en: "Can you help me?" },
+        ]
+      }
+    ],
+    table: {
+      headers: ["Pronoun","hablar (-AR)","comer (-ER)","vivir (-IR)"],
+      rows: [
+        ["yo","hablo","como","vivo"],
+        ["tú","hablas","comes","vives"],
+        ["él/ella","habla","come","vive"],
+        ["nosotros","hablamos","comemos","vivimos"],
+        ["vosotros","habláis","coméis","vivís"],
+        ["ellos","hablan","comen","viven"],
+      ]
+    }
+  },
+  {
+    title: "Ser vs Estar",
+    icon: "🔄",
+    sections: [
+      {
+        rule: `<code>SER</code>: identity, origin, profession, relationships, time, material, possession, events. <code>ESTAR</code>: location, temporary states, ongoing actions (present continuous), results of change.`,
+        examples: [
+          { es: "Soy español. Soy médico.", en: "I'm Spanish. I'm a doctor. (SER - origin, profession)" },
+          { es: "Estoy en Madrid. Estoy cansado.", en: "I'm in Madrid. I'm tired. (ESTAR - location, state)" },
+          { es: "La boda es en el jardín.", en: "The wedding is in the garden. (SER - event)" },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Preterite vs Imperfect",
+    icon: "⏮️",
+    sections: [
+      {
+        rule: `<code>Pretérito Indefinido</code>: completed actions, specific times, sequences of events. <code>Imperfecto</code>: habitual past, descriptions, background, states, interrupted actions.`,
+        examples: [
+          { es: "Ayer comí paella. (specific, completed)", en: "Yesterday I ate paella." },
+          { es: "De niño comía paella cada domingo. (habitual)", en: "As a child I used to eat paella every Sunday." },
+          { es: "Llovía cuando llegué. (background + event)", en: "It was raining when I arrived." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Future Simple",
+    icon: "🔮",
+    sections: [
+      {
+        rule: `Add future endings to the infinitive: <code>-é, -ás, -á, -emos, -éis, -án</code>. Irregular stems include: tener→tendr-, venir→vendr-, hacer→har-, decir→dir-.`,
+        examples: [
+          { es: "Mañana hablaré con él.", en: "Tomorrow I will speak with him." },
+          { es: "¿Vendrás a la fiesta?", en: "Will you come to the party?" },
+          { es: "Habrá mucha gente.", en: "There will be lots of people." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Reflexive Verbs",
+    icon: "🪞",
+    sections: [
+      {
+        rule: `Reflexive verbs use pronouns <code>me, te, se, nos, os, se</code>. They express actions done to oneself. Common ones: levantarse, ducharse, llamarse, vestirse, acostarse, sentirse.`,
+        examples: [
+          { es: "Me levanto a las siete.", en: "I get up at seven." },
+          { es: "Se llama Roberto.", en: "His name is Roberto." },
+          { es: "Nos duchamos por la mañana.", en: "We shower in the morning." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Pronouns: Direct & Indirect Object",
+    icon: "👤",
+    sections: [
+      {
+        rule: `Direct object pronouns: <code>me, te, lo/la, nos, os, los/las</code>. Indirect: <code>me, te, le, nos, os, les</code>. They come before conjugated verbs, or attach to infinitives/gerunds.`,
+        examples: [
+          { es: "Lo veo todos los días. (I see him/it every day)", en: "Direct object." },
+          { es: "Le doy el libro a María. (I give the book to María)", en: "Indirect object." },
+          { es: "Quiero comprarlo. / Lo quiero comprar.", en: "I want to buy it." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Gustar & Similar Verbs",
+    icon: "❤️",
+    sections: [
+      {
+        rule: `<code>Gustar</code> works backwards: 'the thing' is the subject. Use <code>gusta</code> (singular) or <code>gustan</code> (plural). Other similar verbs: encantar, molestar, interesar, doler, parecer.`,
+        examples: [
+          { es: "Me gusta el café.", en: "I like coffee. (lit. Coffee pleases me)" },
+          { es: "Les gustan las películas.", en: "They like films." },
+          { es: "Me encanta bailar.", en: "I love dancing." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Subjunctive (Present)",
+    icon: "🎭",
+    sections: [
+      {
+        rule: `The subjunctive is used after: expressions of desire/wish (quiero que), doubt/denial, emotion, and impersonal expressions (es importante que, es necesario que). It triggers in subordinate clauses with <code>que</code>.`,
+        examples: [
+          { es: "Quiero que vengas.", en: "I want you to come." },
+          { es: "Es importante que estudies.", en: "It's important that you study." },
+          { es: "Espero que llueva mañana.", en: "I hope it rains tomorrow." },
+        ]
+      }
+    ]
+  },
+  {
+    title: "Hay / Está(n)",
+    icon: "📍",
+    sections: [
+      {
+        rule: `<code>Hay</code> (from haber) = there is/there are — for existence. <code>Está/Están</code> = is/are — for location of specific things. Hay never changes for number.`,
+        examples: [
+          { es: "Hay un banco cerca de aquí.", en: "There is a bank near here. (existence)" },
+          { es: "El banco está en la calle Mayor.", en: "The bank is on Calle Mayor. (location)" },
+          { es: "Hay muchas tiendas en el centro.", en: "There are many shops in the centre." },
+        ]
+      }
+    ]
+  },
+];
+
+// =========================================
+// STATE MANAGEMENT
+// =========================================
+
+const DEFAULT_STATE = {
+  xp: 0,
+  level: 1,
+  streak: 0,
+  lastStudied: null,
+  lessonsCompleted: 0,
+  perfectLessons: 0,
+  wordsLearned: 0,
+  questionsAnswered: 0,
+  questionsCorrect: 0,
+  topicsProgress: {},
+  topicsStarted: 0,
+  topicsCompleted: 0,
+  earnedBadges: [],
+  earnedTrophies: [],
+  vocabMastery: {},
+  dailyChallenges: 0,
+  nightSessions: 0,
+  speedRounds: 0,
+  bestAccuracy: 0,
+  weeklyStreak: [],
+};
+
+// Use a single const object — NEVER reassigned, only mutated in-place.
+// Every function that closed over STATE will always see the latest values.
+const STATE = loadState();
+window.STATE = STATE;
+window.DEFAULT_STATE = DEFAULT_STATE;
+
+// Called by Firebase module after pulling cloud data.
+// Mutates STATE in-place so all functions share the same reference.
+window._syncStateRef = function(newState) {
+  // Wipe current keys and copy all new keys in
+  Object.keys(STATE).forEach(k => delete STATE[k]);
+  Object.assign(STATE, newState);
+  window.STATE = STATE;
+  console.log("🔁 STATE synced in-place — XP:", STATE.xp, "| Lessons:", STATE.lessonsCompleted);
+};
+let currentExercises = [];
+let currentExerciseIndex = 0;
+let lessonXpGained = 0;
+let lessonCorrect = 0;
+let lessonTotal = 0;
+let currentTopicId = null;
+let flashcardIndex = 0;
+let flashcardDeck = [];
+let currentVocabFilter = 'All';
+
+function loadState() {
+  try {
+    const saved = localStorage.getItem('espanol_state_v2');
+    return saved ? { ...DEFAULT_STATE, ...JSON.parse(saved) } : { ...DEFAULT_STATE };
+  } catch { return { ...DEFAULT_STATE }; }
+}
+
+function saveState() {
+  try { localStorage.setItem('espanol_state_v2', JSON.stringify(STATE)); } catch {}
+  // Push to Firebase (debounced)
+  if (window._firebase?.configured) {
+    window._firebase.scheduleSave(STATE);
+  }
+}
+
+// =========================================
+// FIREBASE AUTH HELPERS (called from HTML)
+// =========================================
+
+function switchAuthTab(tab, btn) {
+  document.querySelectorAll('.auth-tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('authFormLogin').style.display    = tab === 'login'    ? 'block' : 'none';
+  document.getElementById('authFormRegister').style.display = tab === 'register' ? 'block' : 'none';
+  document.getElementById('authStatus').style.display = 'none';
+}
+
+function doLogin() {
+  const email    = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  if (!email || !password) return;
+  window._firebase?.login(email, password);
+}
+
+function doRegister() {
+  const email    = document.getElementById('regEmail').value.trim();
+  const password = document.getElementById('regPassword').value;
+  if (!email || !password) return;
+  window._firebase?.register(email, password);
+}
+
+function doLogout() {
+  if (confirm('Sign out? Your progress is saved to the cloud.')) {
+    window._firebase?.logout();
+  }
+}
+
+function skipAuth() {
+  document.getElementById('authOverlay').style.display = 'none';
+  showToast('Running offline — progress saved locally only.', '');
+}
+
+
+// =========================================
+// LEVEL SYSTEM
+// =========================================
+
+const LEVELS = [
+  { level:1, name:"Principiante", xpNeeded:0, total:100 },
+  { level:2, name:"Aprendiz", xpNeeded:100, total:250 },
+  { level:3, name:"Básico", xpNeeded:250, total:500 },
+  { level:4, name:"Elemental", xpNeeded:500, total:900 },
+  { level:5, name:"Competente", xpNeeded:900, total:1400 },
+  { level:6, name:"Practicante", xpNeeded:1400, total:2100 },
+  { level:7, name:"Aventajado", xpNeeded:2100, total:3000 },
+  { level:8, name:"Avanzado", xpNeeded:3000, total:4200 },
+  { level:9, name:"Experto", xpNeeded:4200, total:5700 },
+  { level:10, name:"Maestro", xpNeeded:5700, total:7500 },
+  { level:11, name:"Virtuoso", xpNeeded:7500, total:9700 },
+  { level:12, name:"Académico", xpNeeded:9700, total:12500 },
+  { level:13, name:"Erudito", xpNeeded:12500, total:16000 },
+  { level:14, name:"Lingüista", xpNeeded:16000, total:20000 },
+  { level:15, name:"DELE A2 Listo", xpNeeded:20000, total:25000 },
+];
+
+function getLevelInfo() {
+  let current = LEVELS[0];
+  for (let l of LEVELS) { if (STATE.xp >= l.xpNeeded) current = l; else break; }
+  return current;
+}
+
+function addXP(amount) {
+  const oldLevel = getLevelInfo().level;
+  STATE.xp += amount;
+  const newLevelInfo = getLevelInfo();
+  STATE.level = newLevelInfo.level;
+  saveState();
+  updateTopBar();
+  if (newLevelInfo.level > oldLevel) showLevelUp(newLevelInfo);
+  checkBadges();
+  checkTrophies();
+}
+
+function updateTopBar() {
+  const info = getLevelInfo();
+  const nextLevel = LEVELS.find(l => l.level === info.level + 1);
+  const xpInLevel = STATE.xp - info.xpNeeded;
+  const xpForNext = nextLevel ? (nextLevel.xpNeeded - info.xpNeeded) : info.total;
+  const pct = nextLevel ? Math.min(100, (xpInLevel / xpForNext) * 100) : 100;
+
+  document.getElementById('xpFill').style.width = pct + '%';
+  document.getElementById('levelLabel').textContent = 'Lv.' + info.level;
+  document.getElementById('xpLabel').textContent = xpInLevel + '/' + xpForNext;
+  document.getElementById('totalXpDisplay').textContent = STATE.xp;
+  document.getElementById('streakDisplay').textContent = STATE.streak;
+  document.getElementById('levelDisplay').textContent = info.name;
+}
+
+// =========================================
+// STREAK
+// =========================================
+
+function updateStreak() {
+  const today = new Date().toDateString();
+  if (STATE.lastStudied === today) return;
+  const yesterday = new Date(Date.now() - 86400000).toDateString();
+  if (STATE.lastStudied === yesterday) {
+    STATE.streak++;
+  } else if (STATE.lastStudied !== today) {
+    STATE.streak = 1;
+  }
+  STATE.lastStudied = today;
+  // Track weekly
+  if (!STATE.weeklyStreak) STATE.weeklyStreak = [];
+  STATE.weeklyStreak.push(today);
+  STATE.weeklyStreak = STATE.weeklyStreak.slice(-30);
+
+  // Check night owl
+  const hour = new Date().getHours();
+  if (hour >= 22 || hour < 4) STATE.nightSessions = (STATE.nightSessions||0)+1;
+
+  saveState();
+  updateTopBar();
+}
+
+// =========================================
+// BADGE & TROPHY SYSTEM
+// =========================================
+
+function checkBadges() {
+  BADGES.forEach(badge => {
+    if (!STATE.earnedBadges.includes(badge.id) && badge.condition(STATE)) {
+      STATE.earnedBadges.push(badge.id);
+      saveState();
+      showToast(`🎖️ Badge Earned: "${badge.name}"!`, 'badge-toast');
+      confetti();
+    }
+  });
+}
+
+function checkTrophies() {
+  TROPHIES.forEach(t => {
+    if (!STATE.earnedTrophies.includes(t.id) && t.check(STATE)) {
+      STATE.earnedTrophies.push(t.id);
+      saveState();
+      showToast(`🏆 Trophy Unlocked: "${t.name}"!`, 'badge-toast');
+      confetti();
+    }
+  });
+}
+
+// =========================================
+// TAB NAVIGATION
+// =========================================
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-content-' + tab).classList.add('active');
+  document.getElementById('tab-' + tab).classList.add('active');
+  if (tab === 'vocabulary') renderVocabGrid();
+  if (tab === 'achievements') renderAchievements();
+  if (tab === 'progress') renderProgress();
+  if (tab === 'grammar') renderGrammar();
+  updateDashboard();
+}
+
+// =========================================
+// DASHBOARD
+// =========================================
+
+function updateDashboard() {
+  // Word of the day (deterministic per day)
+  const dayIdx = Math.floor(Date.now() / 86400000) % WORDS_OF_DAY.length;
+  const wotd = WORDS_OF_DAY[dayIdx];
+  document.getElementById('wotdWord').textContent = wotd.word;
+  document.getElementById('wotdType').textContent = wotd.type;
+  document.getElementById('wotdMeaning').textContent = wotd.meaning;
+  document.getElementById('wotdExample').textContent = '"' + wotd.example + '"';
+
+  // Stats
+  const acc = STATE.questionsAnswered > 0 ? Math.round((STATE.questionsCorrect/STATE.questionsAnswered)*100) + '%' : '—';
+  document.getElementById('dashWordsLearned').textContent = STATE.wordsLearned;
+  document.getElementById('dashLessons').textContent = STATE.lessonsCompleted;
+  document.getElementById('dashAccuracy').textContent = acc;
+  document.getElementById('dashStreak').textContent = STATE.streak + '🔥';
+
+  // DC status
+  const todayDC = localStorage.getItem('daily_challenge_date');
+  const today = new Date().toDateString();
+  document.getElementById('dcStatus').textContent = todayDC === today ? '✅ DONE' : 'START';
+
+  // Topics grid
+  const grid = document.getElementById('topicsGrid');
+  grid.innerHTML = '';
+  TOPICS.slice(0, 9).forEach(topic => {
+    const prog = STATE.topicsProgress[topic.id] || 0;
+    const pct = Math.round((prog / topic.exercises) * 100);
+    const div = document.createElement('div');
+    div.className = 'topic-card';
+    div.onclick = () => startLesson(topic.id);
+    div.innerHTML = `
+      <div class="topic-icon">${topic.icon}</div>
+      <span class="topic-pill ${topic.pill}">${topic.category}</span>
+      <h3>${topic.name}</h3>
+      <p>${topic.desc}</p>
+      <div class="progress-bar" style="margin-bottom:0.5rem;"><div class="progress-fill" style="width:${pct}%"></div></div>
+      <div class="topic-progress"><span>${prog}/${topic.exercises} done</span><span>${pct}%</span></div>
+    `;
+    grid.appendChild(div);
+  });
+}
+
+function renderLearnModules() {
+  const container = document.getElementById('learnModules');
+  container.innerHTML = '';
+  const categories = [...new Set(TOPICS.map(t => t.category))];
+  categories.forEach(cat => {
+    const catTopics = TOPICS.filter(t => t.category === cat);
+    const h = document.createElement('div');
+    h.innerHTML = `<div class="section-label" style="margin-bottom:0.75rem;">${cat}</div>`;
+    container.appendChild(h);
+    const grid = document.createElement('div');
+    grid.className = 'grid-3';
+    grid.style.marginBottom = '2rem';
+    catTopics.forEach(topic => {
+      const prog = STATE.topicsProgress[topic.id] || 0;
+      const pct = Math.round((prog / topic.exercises) * 100);
+      const completed = pct === 100;
+      const div = document.createElement('div');
+      div.className = 'topic-card';
+      if (completed) div.style.borderColor = 'rgba(34,197,94,0.3)';
+      div.onclick = () => startLesson(topic.id);
+      div.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+          <div class="topic-icon">${topic.icon}</div>
+          ${completed ? '<span style="color:var(--success);font-size:1.2rem;">✓</span>' : ''}
+        </div>
+        <span class="topic-pill ${topic.pill}">${topic.category}</span>
+        <h3>${topic.name}</h3>
+        <p>${topic.desc}</p>
+        <div style="margin:0.75rem 0;">
+          <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+        </div>
+        <div class="topic-progress">
+          <span>${topic.exercises} exercises • ${topic.xpPer} XP each</span>
+          <span>${pct}%</span>
+        </div>
+      `;
+      grid.appendChild(div);
+    });
+    container.appendChild(grid);
+  });
+}
+
+// =========================================
+// LESSON ENGINE
+// =========================================
+
+function startLesson(topicId, mode = 'normal') {
+  updateStreak();
+  currentTopicId = topicId;
+  const topic = TOPICS.find(t => t.id === topicId);
+  currentExercises = generateExercises(topicId, topic ? topic.exercises : 8);
+  currentExerciseIndex = 0;
+  lessonXpGained = 0;
+  lessonCorrect = 0;
+  lessonTotal = currentExercises.length;
+
+  if (!STATE.topicsProgress[topicId]) {
+    STATE.topicsStarted = (STATE.topicsStarted || 0) + 1;
+  }
+
+  document.getElementById('lessonView').classList.add('open');
+  document.getElementById('lessonXpGained').textContent = '0';
+  updateLessonProgress();
+  renderCurrentExercise();
+  saveState();
+}
+
+function closeLessonView() {
+  document.getElementById('lessonView').classList.remove('open');
+  updateDashboard();
+}
+
+function updateLessonProgress() {
+  const pct = currentExercises.length > 0 ? (currentExerciseIndex / currentExercises.length) * 100 : 0;
+  document.getElementById('lessonProgressFill').style.width = pct + '%';
+}
+
+function renderCurrentExercise() {
+  if (currentExerciseIndex >= currentExercises.length) {
+    showLessonResult();
+    return;
+  }
+  const ex = currentExercises[currentExerciseIndex];
+  const body = document.getElementById('lessonBody');
+  body.innerHTML = '';
+
+  const card = document.createElement('div');
+  card.className = 'exercise-card';
+
+  let html = '';
+  const typeLabels = { mc:'Multiple Choice', fill:'Fill in the Blank', translate:'Translate', wordorder:'Word Order', listen:'Listening', speak:'Speaking' };
+  const typeBadges = { mc:'badge-mc', fill:'badge-fill', translate:'badge-translate', wordorder:'badge-match', listen:'badge-listen', speak:'badge-speak' };
+  const diffStars = { easy:'⭐', medium:'⭐⭐', hard:'⭐⭐⭐' };
+
+  html += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+    <span class="exercise-type-badge ${typeBadges[ex.type]||'badge-mc'}">${typeLabels[ex.type]||'Exercise'}</span>
+    <span style="font-size:0.8rem;color:var(--text3)">${diffStars[ex.difficulty]||'⭐'} ${ex.difficulty||'easy'}</span>
+  </div>`;
+
+  // Audio button for all exercises
+  const speakText = ex.question || (ex.words ? ex.words.join(' ') : '');
+  html += `<button class="audio-btn" onclick="speakText(this,'${speakText.replace(/'/g,"\\'")}')" title="Listen to question">🔊 Listen</button>`;
+
+  if (ex.type === 'mc') {
+    html += `<div class="exercise-question">${ex.question}</div>`;
+    if (ex.hint) html += `<div class="exercise-hint">${ex.hint}</div>`;
+    html += `<div class="choices" id="choices">`;
+    const letters = ['A','B','C','D'];
+    ex.options.forEach((opt, i) => {
+      html += `<button class="choice-btn" onclick="checkMC(this,${i},${ex.answer},'${(ex.explanation||'').replace(/'/g,"\\'")}','${(opt||'').replace(/'/g,"\\'")}')">
+        <span class="choice-letter">${letters[i]}</span>${opt}
+      </button>`;
+    });
+    html += `</div>`;
+  } else if (ex.type === 'fill') {
+    html += `<div class="exercise-question">${ex.question}</div>`;
+    if (ex.hint) html += `<div class="exercise-hint">${ex.hint}</div>`;
+    html += `<input class="fill-input" id="fillInput" placeholder="Type your answer..." autocomplete="off" 
+      onkeydown="if(event.key==='Enter')checkFill()" />`;
+    html += `<div style="margin-top:1rem;"><button class="btn btn-outline" onclick="checkFill()" style="margin-right:0.5rem;">Check ✓</button></div>`;
+  } else if (ex.type === 'translate') {
+    html += `<div class="exercise-question">Translate: "<em>${ex.question}</em>"</div>`;
+    html += `<input class="fill-input" id="fillInput" placeholder="Write in Spanish..." autocomplete="off" 
+      onkeydown="if(event.key==='Enter')checkTranslate()" />`;
+    html += `<div style="margin-top:1rem;"><button class="btn btn-outline" onclick="checkTranslate()">Check ✓</button></div>`;
+  } else if (ex.type === 'wordorder') {
+    html += `<div class="exercise-question">Put the words in the correct order:</div>`;
+    const shuffled = [...ex.words].sort(() => Math.random() - 0.5);
+    html += `<div class="answer-area" id="answerArea" onclick="removeFromAnswer(event)"></div>`;
+    html += `<div class="word-bank" id="wordBank">`;
+    shuffled.forEach((w, i) => {
+      html += `<span class="word-chip" id="wc${i}" onclick="addToAnswer('${w.replace(/'/g,"\\'")}','wc${i}')">${w}</span>`;
+    });
+    html += `</div>`;
+    html += `<button class="btn btn-outline" onclick="checkWordOrder('${ex.answer.replace(/'/g,"\\'")}')" style="margin-top:0.5rem;">Check ✓</button>
+      <button class="btn" onclick="clearWordOrder()" style="margin-top:0.5rem;margin-left:0.5rem;background:var(--surface3);color:var(--text2)">Clear ↺</button>`;
+  }
+
+  html += `<div class="feedback-area" id="feedbackArea"></div>`;
+  html += `<button class="lesson-continue-btn" id="continueBtn" onclick="nextExercise()" style="display:none;">Continue →</button>`;
+
+  card.innerHTML = html;
+  body.appendChild(card);
+
+  // Step counter
+  const counter = document.createElement('div');
+  counter.style.cssText = 'text-align:center;color:var(--text3);font-size:0.85rem;margin-top:1rem;';
+  counter.textContent = `Question ${currentExerciseIndex+1} of ${currentExercises.length}`;
+  body.appendChild(counter);
+}
+
+// =========================================
+// EXERCISE CHECKERS
+// =========================================
+
+function checkMC(btn, selected, correct, explanation, selectedText) {
+  const allBtns = document.querySelectorAll('.choice-btn');
+  allBtns.forEach(b => b.disabled = true);
+  const isCorrect = selected === correct;
+  btn.classList.add(isCorrect ? 'correct' : 'wrong');
+  if (!isCorrect) allBtns[correct].classList.add('correct');
+  handleResult(isCorrect, explanation, selectedText);
+  speakText(null, allBtns[correct].textContent.slice(1)); // speak correct answer
+}
+
+function checkFill() {
+  const input = document.getElementById('fillInput');
+  const ex = currentExercises[currentExerciseIndex];
+  const userAns = input.value.trim().toLowerCase();
+  const isCorrect = ex.answer.some(a => normalize(userAns) === normalize(a));
+  input.classList.add(isCorrect ? 'correct' : 'wrong');
+  input.disabled = true;
+  if (!isCorrect) {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'margin-top:0.5rem;font-size:0.85rem;color:var(--text3);';
+    hint.textContent = 'Correct: ' + ex.answer[0];
+    input.parentNode.insertBefore(hint, input.nextSibling);
+  }
+  handleResult(isCorrect, ex.explanation);
+}
+
+function checkTranslate() {
+  const input = document.getElementById('fillInput');
+  const ex = currentExercises[currentExerciseIndex];
+  const userAns = input.value.trim().toLowerCase();
+  const correctAns = (ex.answer || '').toLowerCase();
+  // Flexible matching: check if 70% of key words match
+  const correctWords = correctAns.split(/\s+/).filter(w => w.length > 2);
+  const userWords = userAns.split(/\s+/);
+  const matches = correctWords.filter(w => userWords.some(u => normalize(u) === normalize(w)));
+  const isCorrect = matches.length >= Math.ceil(correctWords.length * 0.65);
+  input.classList.add(isCorrect ? 'correct' : 'wrong');
+  input.disabled = true;
+  if (!isCorrect) {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'margin-top:0.5rem;font-size:0.85rem;color:var(--text3);';
+    hint.textContent = 'Correct: ' + ex.answer;
+    input.parentNode.insertBefore(hint, input.nextSibling);
+  }
+  handleResult(isCorrect, ex.explanation);
+  speakText(null, ex.answer);
+}
+
+function normalize(str) {
+  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.!?,;]/g,'').trim();
+}
+
+let wordOrderAnswer = [];
+function addToAnswer(word, chipId) {
+  const chip = document.getElementById(chipId);
+  if (chip.classList.contains('used')) return;
+  chip.classList.add('used');
+  wordOrderAnswer.push({ word, chipId });
+  const area = document.getElementById('answerArea');
+  const ac = document.createElement('span');
+  ac.className = 'answer-chip';
+  ac.dataset.chipId = chipId;
+  ac.innerHTML = word + ' <span style="opacity:0.5;font-size:0.7rem;">✕</span>';
+  area.appendChild(ac);
+}
+
+function removeFromAnswer(e) {
+  const chip = e.target.closest('.answer-chip');
+  if (!chip) return;
+  const chipId = chip.dataset.chipId;
+  document.getElementById(chipId)?.classList.remove('used');
+  wordOrderAnswer = wordOrderAnswer.filter(w => w.chipId !== chipId);
+  chip.remove();
+}
+
+function clearWordOrder() {
+  wordOrderAnswer = [];
+  document.querySelectorAll('.answer-chip').forEach(c => c.remove());
+  document.querySelectorAll('.word-chip').forEach(c => c.classList.remove('used'));
+}
+
+function checkWordOrder(correct) {
+  const userAnswer = wordOrderAnswer.map(w => w.word).join(' ');
+  const isCorrect = normalize(userAnswer) === normalize(correct);
+  const ex = currentExercises[currentExerciseIndex];
+  handleResult(isCorrect, ex.explanation);
+  if (!isCorrect) {
+    const hint = document.createElement('div');
+    hint.style.cssText = 'margin-top:0.5rem;font-size:0.85rem;color:var(--text3);';
+    hint.textContent = 'Correct: ' + correct;
+    document.getElementById('answerArea').after(hint);
+  }
+  speakText(null, correct);
+}
+
+function handleResult(isCorrect, explanation, chosen) {
+  STATE.questionsAnswered++;
+  if (isCorrect) {
+    STATE.questionsCorrect++;
+    lessonCorrect++;
+    const xpGain = isCorrect ? (currentExercises[currentExerciseIndex]?.difficulty === 'hard' ? 20 : currentExercises[currentExerciseIndex]?.difficulty === 'medium' ? 15 : 10) : 0;
+    lessonXpGained += xpGain;
+    document.getElementById('lessonXpGained').textContent = lessonXpGained;
+    addXP(xpGain);
+    showXPPopup(xpGain);
+  }
+
+  const fb = document.getElementById('feedbackArea');
+  fb.className = 'feedback-area show ' + (isCorrect ? 'feedback-correct' : 'feedback-wrong');
+  fb.innerHTML = `
+    <div class="feedback-title">${isCorrect ? '✅ ¡Correcto!' : '❌ Incorrecto'}</div>
+    <div class="feedback-text">${explanation || (isCorrect ? '¡Muy bien!' : 'Keep going!')}</div>
+    ${isCorrect ? '' : `<div style="margin-top:0.5rem;"><button class="audio-btn" onclick="speakText(this,'${(explanation||'').replace(/'/g,"\\'")}')">🔊 Hear explanation</button></div>`}
+  `;
+
+  document.getElementById('continueBtn').style.display = 'block';
+  wordOrderAnswer = [];
+  saveState();
+}
+
+function nextExercise() {
+  currentExerciseIndex++;
+  updateLessonProgress();
+  renderCurrentExercise();
+}
+
+function showLessonResult() {
+  const accuracy = lessonTotal > 0 ? Math.round((lessonCorrect / lessonTotal) * 100) : 0;
+  STATE.lessonsCompleted++;
+  if (accuracy === 100) STATE.perfectLessons++;
+  if (accuracy > (STATE.bestAccuracy || 0)) STATE.bestAccuracy = accuracy;
+
+  // Update topic progress
+  const topic = TOPICS.find(t => t.id === currentTopicId);
+  if (topic) {
+    STATE.topicsProgress[currentTopicId] = Math.min(topic.exercises, (STATE.topicsProgress[currentTopicId] || 0) + lessonTotal);
+    if ((STATE.topicsProgress[currentTopicId] || 0) >= topic.exercises) {
+      STATE.topicsCompleted = Object.entries(STATE.topicsProgress).filter(([k,v]) => {
+        const t = TOPICS.find(tp => tp.id === k);
+        return t && v >= t.exercises;
+      }).length;
+    }
+  }
+
+  // Words learned
+  STATE.wordsLearned = Math.min(VOCABULARY.length, STATE.wordsLearned + Math.floor(lessonCorrect * 0.5));
+  saveState();
+  checkBadges();
+  checkTrophies();
+
+  const body = document.getElementById('lessonBody');
+  const trophyEmoji = accuracy >= 90 ? '🏆' : accuracy >= 70 ? '⭐' : '💪';
+  const resultTitle = accuracy >= 90 ? '¡Excelente!' : accuracy >= 70 ? '¡Muy bien!' : '¡Sigue así!';
+
+  body.innerHTML = `
+    <div class="result-screen">
+      <div class="result-trophy">${trophyEmoji}</div>
+      <div class="result-title">${resultTitle}</div>
+      <p style="color:var(--text2);margin-bottom:1rem;">Lesson complete!</p>
+      <div class="result-stats">
+        <div class="result-stat">
+          <span class="value" style="color:var(--accent)">${lessonXpGained}</span>
+          <span class="label">XP Earned</span>
+        </div>
+        <div class="result-stat">
+          <span class="value" style="color:var(--accent3)">${accuracy}%</span>
+          <span class="label">Accuracy</span>
+        </div>
+        <div class="result-stat">
+          <span class="value" style="color:var(--accent4)">${lessonCorrect}/${lessonTotal}</span>
+          <span class="label">Correct</span>
+        </div>
+      </div>
+      ${accuracy === 100 ? '<div style="background:rgba(245,200,66,0.1);border:1px solid rgba(245,200,66,0.3);border-radius:10px;padding:1rem;margin-bottom:1.5rem;color:var(--accent);">💎 Perfect Score! Bonus 50 XP!</div>' : ''}
+      <div style="display:flex;gap:1rem;flex-wrap:wrap;justify-content:center;">
+        <button class="btn btn-primary btn-lg" onclick="startLesson('${currentTopicId}')">🔄 Retry Topic</button>
+        <button class="btn btn-outline btn-lg" onclick="closeLessonView()">← Back to Dashboard</button>
+      </div>
+    </div>
+  `;
+
+  if (accuracy === 100) { addXP(50); confetti(); }
+  updateLessonProgress();
+}
+
+// =========================================
+// DAILY CHALLENGE
+// =========================================
+
+function startDailyChallenge() {
+  const today = new Date().toDateString();
+  if (localStorage.getItem('daily_challenge_date') === today) {
+    showToast("✅ Daily challenge already completed today!", '');
+    return;
+  }
+  // Pick random topic
+  const randomTopic = TOPICS[Math.floor(Math.random() * TOPICS.length)];
+  STATE.dailyChallenges = (STATE.dailyChallenges || 0) + 1;
+  localStorage.setItem('daily_challenge_date', today);
+  saveState();
+  startLesson(randomTopic.id);
+  showToast('🎯 Daily Challenge started! 2× XP today!', 'xp-toast');
+}
+
+// =========================================
+// PRACTICE MODES
+// =========================================
+
+function startPracticeMode(mode) {
+  if (mode === 'speed') {
+    STATE.speedRounds = (STATE.speedRounds || 0) + 1;
+    saveState();
+  }
+  const randomTopic = TOPICS[Math.floor(Math.random() * TOPICS.length)];
+  startLesson(randomTopic.id, mode);
+  showToast(`🎯 ${mode.charAt(0).toUpperCase()+mode.slice(1)} mode starting!`, '');
+}
+
+// =========================================
+// VOCABULARY
+// =========================================
+
+let allVocab = VOCABULARY;
+let filteredVocab = [...allVocab];
+
+function renderVocabFilters() {
+  const cats = ['All', ...new Set(VOCABULARY.map(v => v.cat))];
+  const container = document.getElementById('vocabFilters');
+  container.innerHTML = '';
+  cats.forEach(cat => {
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn' + (cat === currentVocabFilter ? ' active' : '');
+    btn.textContent = cat;
+    btn.onclick = () => {
+      currentVocabFilter = cat;
+      filterVocab('');
+      renderVocabFilters();
+    };
+    container.appendChild(btn);
+  });
+}
+
+function filterVocab(searchTerm) {
+  filteredVocab = VOCABULARY.filter(v => {
+    const matchCat = currentVocabFilter === 'All' || v.cat === currentVocabFilter;
+    const matchSearch = !searchTerm || v.es.includes(searchTerm.toLowerCase()) || v.en.includes(searchTerm.toLowerCase());
+    return matchCat && matchSearch;
+  });
+  renderVocabGrid();
+}
+
+function renderVocabGrid() {
+  renderVocabFilters();
+  const grid = document.getElementById('vocabGrid');
+  grid.innerHTML = '';
+  filteredVocab.forEach((v, i) => {
+    const mastery = (STATE.vocabMastery && STATE.vocabMastery[v.es]) || 0;
+    const div = document.createElement('div');
+    div.className = 'vocab-tile' + (mastery >= 3 ? ' mastered' : '');
+    div.onclick = () => speakSpanish(v.es);
+    div.innerHTML = `
+      <div class="es">${v.es}</div>
+      <div class="en">${v.en}</div>
+      <div class="mastery"><div class="mastery-fill" style="width:${Math.min(100,mastery*33)}%"></div></div>
+      <div style="font-size:0.65rem;color:var(--text3);margin-top:0.25rem;">${['New','Learning','Almost','Mastered'][Math.min(3,mastery)]}</div>
+    `;
+    grid.appendChild(div);
+  });
+}
+
+function startVocabQuiz() {
+  const randomTopic = TOPICS.find(t => t.id === 'greetings') || TOPICS[0];
+  startLesson(randomTopic.id);
+}
+
+// =========================================
+// FLASHCARDS
+// =========================================
+
+function showFlashcards() {
+  flashcardDeck = filteredVocab.length > 0 ? filteredVocab : VOCABULARY;
+  flashcardDeck = [...flashcardDeck].sort(() => Math.random() - 0.5);
+  flashcardIndex = 0;
+  document.getElementById('flashcardOverlay').classList.add('open');
+  renderFlashcard();
+}
+
+function closeFlashcards() {
+  document.getElementById('flashcardOverlay').classList.remove('open');
+  document.getElementById('mainFlashcard').classList.remove('flipped');
+}
+
+function renderFlashcard() {
+  if (flashcardDeck.length === 0) return;
+  const card = flashcardDeck[flashcardIndex];
+  document.getElementById('fcCategory').textContent = card.cat;
+  document.getElementById('fcWord').textContent = card.es;
+  document.getElementById('fcTranslation').textContent = card.en;
+  document.getElementById('fcExample').textContent = card.example || '';
+  document.getElementById('flashcardCounter').textContent = `Card ${flashcardIndex + 1} of ${flashcardDeck.length}`;
+  document.getElementById('mainFlashcard').classList.remove('flipped');
+
+  // Audio
+  document.getElementById('fcAudio').innerHTML = `
+    <button class="audio-btn" onclick="speakSpanish('${card.es.replace(/'/g,"\\'")}')">🔊 Español</button>
+    <button class="audio-btn" onclick="speakEnglish('${card.en.replace(/'/g,"\\'")}')">🔊 English</button>
+  `;
+}
+
+function flipCard() {
+  document.getElementById('mainFlashcard').classList.toggle('flipped');
+}
+
+function flashcardAnswer(easy) {
+  const card = flashcardDeck[flashcardIndex];
+  if (!STATE.vocabMastery) STATE.vocabMastery = {};
+  if (easy === true) {
+    STATE.vocabMastery[card.es] = Math.min(3, (STATE.vocabMastery[card.es] || 0) + 1);
+    addXP(5);
+    showXPPopup(5);
+  } else if (easy === false) {
+    STATE.vocabMastery[card.es] = Math.max(0, (STATE.vocabMastery[card.es] || 0) - 1);
+  }
+  STATE.wordsLearned = Object.keys(STATE.vocabMastery).length;
+  saveState();
+  nextFlashcard();
+}
+
+function nextFlashcard() {
+  flashcardIndex = (flashcardIndex + 1) % flashcardDeck.length;
+  renderFlashcard();
+}
+
+function prevFlashcard() {
+  flashcardIndex = (flashcardIndex - 1 + flashcardDeck.length) % flashcardDeck.length;
+  renderFlashcard();
+}
+
+// =========================================
+// GRAMMAR
+// =========================================
+
+function renderGrammar() {
+  const container = document.getElementById('grammarContent');
+  container.innerHTML = '';
+  GRAMMAR_DATA.forEach(section => {
+    const div = document.createElement('div');
+    div.className = 'grammar-section card';
+    div.style.marginBottom = '1.25rem';
+    let html = `<h3 style="font-family:'Playfair Display',serif;font-size:1.3rem;margin-bottom:1rem;">${section.icon} ${section.title}</h3>`;
+
+    if (section.table) {
+      html += `<div style="overflow-x:auto;"><table class="conjugation-table">
+        <thead><tr>${section.table.headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+        <tbody>`;
+      section.table.rows.forEach(row => {
+        html += `<tr>${row.map((cell,i)=>`<td class="${i===0?'pronoun':'verb-form'}">${cell}</td>`).join('')}</tr>`;
+      });
+      html += `</tbody></table></div>`;
+    }
+
+    section.sections.forEach(s => {
+      html += `<div class="grammar-rule">${s.rule}</div>`;
+      s.examples.forEach(ex => {
+        html += `<div class="example-sentence">
+          <div class="es">${ex.es} <button class="audio-btn" style="display:inline-flex;padding:0.2rem 0.6rem;margin-left:0.5rem;font-size:0.75rem;" onclick="speakSpanish('${ex.es.replace(/'/g,"\\'")}')">🔊</button></div>
+          <div class="en">${ex.en}</div>
+        </div>`;
+      });
+    });
+
+    div.innerHTML = html;
+    container.appendChild(div);
+  });
+}
+
+// =========================================
+// ACHIEVEMENTS
+// =========================================
+
+function renderAchievements() {
+  // Trophies
+  const trophyDiv = document.getElementById('trophyDisplay');
+  trophyDiv.innerHTML = '';
+  TROPHIES.forEach(t => {
+    const earned = STATE.earnedTrophies.includes(t.id);
+    const div = document.createElement('div');
+    div.className = 'trophy-card';
+    if (!earned) div.style.opacity = '0.4';
+    div.innerHTML = `
+      <span class="trophy-icon">${t.icon}</span>
+      <div class="trophy-title">${t.name}</div>
+      <div class="trophy-req">${t.req}</div>
+      ${earned ? '<div style="color:var(--success);font-size:0.8rem;margin-top:0.5rem;">✅ Earned!</div>' : ''}
+    `;
+    trophyDiv.appendChild(div);
+  });
+
+  // Badges
+  const badgeDiv = document.getElementById('badgeGrid');
+  badgeDiv.innerHTML = '';
+  BADGES.forEach(badge => {
+    const earned = STATE.earnedBadges.includes(badge.id);
+    const div = document.createElement('div');
+    div.className = 'badge-card ' + (earned ? 'earned' : 'locked');
+    div.innerHTML = `
+      ${earned ? '<span class="badge-earned-tag">EARNED</span>' : ''}
+      <span class="badge-icon">${badge.icon}</span>
+      <div class="badge-name">${badge.name}</div>
+      <div class="badge-desc">${badge.desc}</div>
+    `;
+    badgeDiv.appendChild(div);
+  });
+}
+
+// =========================================
+// PROGRESS
+// =========================================
+
+function renderProgress() {
+  const acc = STATE.questionsAnswered > 0 ? Math.round((STATE.questionsCorrect/STATE.questionsAnswered)*100) : 0;
+  document.getElementById('progXP').textContent = STATE.xp;
+  document.getElementById('progLevel').textContent = STATE.level;
+  document.getElementById('progQuestions').textContent = STATE.questionsAnswered;
+  document.getElementById('progAccuracy').textContent = STATE.questionsAnswered > 0 ? acc + '%' : '—%';
+  document.getElementById('progStreak').textContent = STATE.streak + '🔥';
+  document.getElementById('progLessons').textContent = STATE.lessonsCompleted;
+
+  // Skills breakdown
+  const skills = [
+    { name: "Grammar", color: "var(--accent4)", value: Math.min(100, ((STATE.topicsProgress['present']||0)+(STATE.topicsProgress['ser-estar']||0)+(STATE.topicsProgress['preterite']||0)) / 45 * 100) },
+    { name: "Vocabulary", color: "var(--accent3)", value: Math.min(100, (STATE.wordsLearned / VOCABULARY.length) * 100) },
+    { name: "Verb Tenses", color: "var(--accent)", value: Math.min(100, ((STATE.topicsProgress['preterite']||0)+(STATE.topicsProgress['imperfect']||0)+(STATE.topicsProgress['future']||0)) / 43 * 100) },
+    { name: "Accuracy", color: "var(--accent5)", value: acc },
+    { name: "Consistency", color: "var(--success)", value: Math.min(100, STATE.streak * 10) },
+    { name: "Overall Progress", color: "var(--accent2)", value: Math.min(100, (STATE.xp / 10000) * 100) },
+  ];
+
+  const sb = document.getElementById('skillsBreakdown');
+  sb.innerHTML = skills.map(s => `
+    <div class="skill-meter">
+      <div class="skill-meter-header">
+        <span class="skill-meter-label">${s.name}</span>
+        <span class="skill-meter-val">${Math.round(s.value)}%</span>
+      </div>
+      <div class="skill-bar"><div class="skill-fill" style="width:${s.value}%;background:${s.color}"></div></div>
+    </div>
+  `).join('');
+
+  // Streak calendar (last 7 days)
+  const cal = document.getElementById('streakCalendar');
+  cal.innerHTML = '';
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400000);
+    const dStr = d.toDateString();
+    const studied = STATE.weeklyStreak && STATE.weeklyStreak.includes(dStr);
+    const isToday = i === 0;
+    const div = document.createElement('div');
+    div.className = 'streak-day ' + (studied ? 'done' : 'empty') + (isToday ? ' today' : '');
+    div.textContent = days[d.getDay()].slice(0,1);
+    div.title = dStr;
+    cal.appendChild(div);
+  }
+}
+
+function resetProgress() {
+  if (confirm('⚠️ Reset ALL progress? This cannot be undone.')) {
+    localStorage.removeItem('espanol_state_v2');
+    localStorage.removeItem('daily_challenge_date');
+    // Mutate in-place so all function closures see the reset
+    Object.keys(STATE).forEach(k => delete STATE[k]);
+    Object.assign(STATE, DEFAULT_STATE);
+    window.STATE = STATE;
+    saveState();
+    updateTopBar();
+    updateDashboard();
+    showToast('Progress reset. ¡Empezamos de nuevo!', '');
+  }
+}
+
+// =========================================
+// AUDIO / SPEECH
+// =========================================
+
+function speakSpanish(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = 'es-ES';
+  utter.rate = 0.9;
+  window.speechSynthesis.speak(utter);
+}
+
+function speakEnglish(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = 'en-GB';
+  utter.rate = 0.95;
+  window.speechSynthesis.speak(utter);
+}
+
+function speakText(btn, text) {
+  if (btn) {
+    btn.classList.add('playing');
+    setTimeout(() => btn.classList.remove('playing'), 2000);
+  }
+  speakSpanish(text);
+}
+
+// =========================================
+// UI HELPERS
+// =========================================
+
+function showToast(msg, cls) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.className = cls ? `show ${cls}` : 'show';
+  clearTimeout(toast._timeout);
+  toast._timeout = setTimeout(() => toast.className = toast.className.replace(' show','').replace('show',''), 3000);
+}
+
+function showXPPopup(amount) {
+  const popup = document.createElement('div');
+  popup.className = 'xp-popup';
+  popup.textContent = '+' + amount + ' XP';
+  popup.style.left = Math.random() * 60 + 20 + '%';
+  popup.style.top = '60%';
+  document.body.appendChild(popup);
+  setTimeout(() => popup.remove(), 1500);
+}
+
+function showLevelUp(levelInfo) {
+  const overlay = document.createElement('div');
+  overlay.className = 'level-up-overlay';
+  overlay.innerHTML = `
+    <div style="text-align:center;">
+      <div style="font-size:4rem;margin-bottom:1rem;">🎉</div>
+      <div class="level-up-text">Level ${levelInfo.level}!</div>
+      <div style="color:var(--accent4);font-size:1.5rem;margin:0.5rem 0;">${levelInfo.name}</div>
+      <p style="color:var(--text2);margin:1rem 0;">¡Fantástico! Keep going!</p>
+      <button class="btn btn-primary" onclick="this.closest('.level-up-overlay').remove()">Continue →</button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  confetti();
+  setTimeout(() => overlay.remove(), 5000);
+}
+
+function confetti() {
+  const container = document.getElementById('confettiContainer');
+  const colors = ['#f5c842','#e8485a','#4ecdc4','#a78bfa','#fb923c','#22c55e'];
+  for (let i = 0; i < 60; i++) {
+    const c = document.createElement('div');
+    c.style.cssText = `
+      position:absolute;
+      width:${Math.random()*10+4}px;height:${Math.random()*10+4}px;
+      background:${colors[Math.floor(Math.random()*colors.length)]};
+      left:${Math.random()*100}%;top:-20px;
+      border-radius:${Math.random()>0.5?'50%':'2px'};
+      animation:fall ${Math.random()*2+1.5}s ease ${Math.random()*0.5}s forwards;
+    `;
+    container.appendChild(c);
+    setTimeout(() => c.remove(), 3000);
+  }
+}
+
+// Add confetti fall animation
+const style = document.createElement('style');
+style.textContent = `@keyframes fall { to { transform: translateY(100vh) rotate(${Math.random()*720}deg); opacity:0; } }`;
+document.head.appendChild(style);
+
+// =========================================
+// INIT
+// =========================================
+
+function init() {
+  // Expose render functions for Firebase auth observer
+  window.updateTopBar      = updateTopBar;
+  window.updateDashboard   = updateDashboard;
+  window.renderLearnModules = renderLearnModules;
+
+  // Splash
+  setTimeout(() => {
+    document.getElementById('splash').style.opacity = '0';
+    setTimeout(() => {
+      document.getElementById('splash').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      updateTopBar();
+      updateDashboard();
+      renderLearnModules();
+    }, 600);
+  }, 2200);
+}
+
+init();
+</script>
+</body>
+</html>

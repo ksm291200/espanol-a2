@@ -133,12 +133,27 @@
             const local = window.STATE || {};
             console.log("📊 Cloud XP:", cloudState.xp, "| Local XP:", local.xp);
             // Merge into STATE in-place via _syncStateRef
-            const merged = {
-              ...window.DEFAULT_STATE,
-              ...cloudState,
-              xp:     Math.max(cloudState.xp || 0, local.xp || 0),
-              streak: Math.max(cloudState.streak || 0, local.streak || 0),
-            };
+            const mergedTopicsProgress = {};
+const allTopicIds = new Set([
+  ...Object.keys(cloudState.topicsProgress || {}),
+  ...Object.keys(local.topicsProgress || {})
+]);
+allTopicIds.forEach(id => {
+  mergedTopicsProgress[id] = Math.max(
+    cloudState.topicsProgress?.[id] || 0,
+    local.topicsProgress?.[id] || 0
+  );
+});
+
+const merged = {
+  ...window.DEFAULT_STATE,
+  ...cloudState,
+  xp: Math.max(cloudState.xp || 0, local.xp || 0),
+  streak: Math.max(cloudState.streak || 0, local.streak || 0),
+  topicsProgress: mergedTopicsProgress,
+  wordsLearned: Math.max(cloudState.wordsLearned || 0, local.wordsLearned || 0),
+  lessonsCompleted: Math.max(cloudState.lessonsCompleted || 0, local.lessonsCompleted || 0),
+};
             if (typeof window._syncStateRef === 'function') window._syncStateRef(merged);
             localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
             console.log("✅ State merged and applied");

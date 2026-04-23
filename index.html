@@ -14,16 +14,29 @@
 <meta name="theme-color" content="#0d0d14">
 <meta name="description" content="DELE A2 Spanish Mastery — vocabulary, grammar, practice.">
 
-<!-- Inline PWA manifest (no separate file needed) -->
-<link rel="manifest" href="data:application/json,{
-  %22name%22:%22%C2%A1Espa%C3%B1ol!%20DELE%20A2%22,
-  %22short_name%22:%22%C2%A1Espa%C3%B1ol!%22,
-  %22start_url%22:%22.%22,
-  %22display%22:%22standalone%22,
-  %22background_color%22:%22%230d0d14%22,
-  %22theme_color%22:%22%230d0d14%22,
-  %22icons%22:[{%22src%22:%22https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f1ea-1f1f8.png%22,%22sizes%22:%2272x72%22,%22type%22:%22image/png%22}]
-}">
+<script>
+// Inject PWA manifest inline — no separate manifest.json file needed
+const _manifest = {
+  name: "¡Español! DELE A2",
+  short_name: "¡Español!",
+  description: "DELE A2 Spanish Mastery — vocabulary, grammar, practice.",
+  start_url: "./",
+  scope: "./",
+  display: "standalone",
+  orientation: "portrait",
+  background_color: "#0d0d14",
+  theme_color: "#0d0d14",
+  icons: [
+    { src: "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f1ea-1f1f8.png", sizes: "72x72",  type: "image/png" },
+    { src: "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f1ea-1f1f8.png", sizes: "192x192", type: "image/png", purpose: "any maskable" }
+  ]
+};
+const _mblob = new Blob([JSON.stringify(_manifest)], { type: 'application/manifest+json' });
+const _mlink = document.createElement('link');
+_mlink.rel = 'manifest';
+_mlink.href = URL.createObjectURL(_mblob);
+document.head.appendChild(_mlink);
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;0,900;1,700&family=DM+Sans:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <!-- Firebase SDK -->
 <script type="module">
@@ -48,10 +61,10 @@
   const auth = getAuth(app);
   const db   = getDatabase(app);
 
-  // Persist auth across PWA restarts, home screen launches, and browser restarts.
-  // browserLocalPersistence uses IndexedDB — survives when the PWA sandboxed
-  // context is closed and re-opened from the home screen icon.
-  setPersistence(auth, browserLocalPersistence).catch(e =>
+  // Must await persistence BEFORE any auth state is observed.
+  // If not awaited, Firebase reads the token before IndexedDB is ready
+  // and sees no user — causing the login screen to flash on every PWA open.
+  await setPersistence(auth, browserLocalPersistence).catch(e =>
     console.warn('Auth persistence could not be set:', e.message)
   );
 
@@ -93,7 +106,111 @@
 
   let saveTimer = null;
 
-  // ── Step 1: Load ALL content from Firebase, then signal app ready ──────────
+  // ── Shared Firebase API — available globally as soon as this module runs ────
+  window._firebase = {
+    configured: true,
+
+    async login(email, password) {
+      try { setAuthStatus('loading', 'Signing in…'); await signInWithEmailAndPassword(auth, email, password); }
+      catch (e) { setAuthStatus('error', friendlyError(e.code)); }
+    },
+
+    async register(email, password) {
+      try { setAuthStatus('loading', 'Creating account…'); await createUserWithEmailAndPassword(auth, email, password); }
+      catch (e) { setAuthStatus('error', friendlyError(e.code)); }
+    },
+
+    async logout() { await signOut(auth); },
+
+    scheduleSave(state) {
+      if (!auth?.currentUser) return;
+      clearTimeout(saveTimer);
+      setSyncIndicator('pending');
+      saveTimer = setTimeout(async () => {
+        try {
+          await set(ref(db, `users/${auth.currentUser.uid}/state`), state);
+          setSyncIndicator('saved');
+        } catch (e) { console.error('❌ Firebase save failed:', e.message); setSyncIndicator('error'); }
+      }, 1500);
+    },
+
+    async pullState() {
+      if (!auth?.currentUser) return null;
+      try {
+        const snap = await get(ref(db, `users/${auth.currentUser.uid}/state`));
+        return snap.exists() ? snap.val() : null;
+      } catch (e) { console.error('❌ Firebase pull failed:', e.message); return null; }
+    },
+  };
+
+  // ── Apply a user's cloud state once the app is ready ────────────────────────
+  // Called either from onAuthStateChanged (fresh login) or when the app
+  // boots with a persisted session already present.
+  function applyUserState(user) {
+    // Wait until STATE and DEFAULT_STATE exist (content loaded + app booted)
+    function tryApply(attempts) {
+      if (!window.DEFAULT_STATE || window.STATE === undefined) {
+        if (attempts < 100) setTimeout(() => tryApply(attempts + 1), 100);
+        else console.error('❌ App never became ready for state sync.');
+        return;
+      }
+
+      document.getElementById('authOverlay').style.display = 'none';
+      document.getElementById('userEmailDisplay').textContent = user.email;
+      document.getElementById('syncUserRow').style.display   = 'flex';
+      setSyncIndicator('loading');
+
+      window._firebase.pullState().then(cloudState => {
+        if (cloudState) {
+          const merged = { ...window.DEFAULT_STATE, ...cloudState };
+          if (typeof window._syncStateRef === 'function') window._syncStateRef(merged);
+          localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
+        } else {
+          // No cloud state yet — push whatever is local to Firebase
+          if (typeof window._syncStateRef === 'function') window._syncStateRef({ ...window.DEFAULT_STATE });
+          localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
+          window._firebase.scheduleSave(window.STATE);
+        }
+
+        setSyncIndicator('saved');
+        if (typeof window.updateTopBar       === 'function') window.updateTopBar();
+        if (typeof window.updateDashboard    === 'function') window.updateDashboard();
+        if (typeof window.renderLearnModules === 'function') window.renderLearnModules();
+
+        // Live listener — remote changes always win
+        onValue(ref(db, `users/${user.uid}/state`), (snap) => {
+          if (!snap.exists()) return;
+          const remote  = snap.val();
+          const current = window.STATE || {};
+          if (JSON.stringify(remote) !== JSON.stringify(current)) {
+            if (typeof window._syncStateRef === 'function')
+              window._syncStateRef({ ...window.DEFAULT_STATE, ...remote });
+            localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
+            if (typeof window.updateTopBar    === 'function') window.updateTopBar();
+            if (typeof window.updateDashboard === 'function') window.updateDashboard();
+            setSyncIndicator('saved');
+          }
+        });
+      });
+    }
+    tryApply(0);
+  }
+
+  // ── Register auth observer immediately — do NOT wait for app boot ──────────
+  // On a PWA home screen launch, Firebase restores the session and fires
+  // onAuthStateChanged before the main script has finished loading.
+  // By registering here (outside waitForApp), we capture that initial event.
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      applyUserState(user);
+    } else {
+      document.getElementById('authOverlay').style.display = 'flex';
+      document.getElementById('syncUserRow').style.display = 'none';
+      document.getElementById('userEmailDisplay').textContent = '';
+    }
+  });
+
+  // ── Load content from Firebase, then boot the app ───────────────────────────
   async function loadContentAndBoot() {
     try {
       const splashStatus = document.getElementById('splashStatus');
@@ -114,99 +231,6 @@
     }
   }
   loadContentAndBoot();
-
-  // ── Step 2: Wire auth & state sync after main script boots ─────────────────
-  function waitForApp(cb, attempts = 0) {
-    if (window.DEFAULT_STATE && window.STATE !== undefined) cb();
-    else if (attempts < 50) setTimeout(() => waitForApp(cb, attempts + 1), 100);
-    else console.error('❌ Main app script never became ready.');
-  }
-
-  waitForApp(() => {
-    window._firebase = {
-      configured: true,
-
-      async login(email, password) {
-        try { setAuthStatus('loading', 'Signing in…'); await signInWithEmailAndPassword(auth, email, password); }
-        catch (e) { setAuthStatus('error', friendlyError(e.code)); }
-      },
-
-      async register(email, password) {
-        try { setAuthStatus('loading', 'Creating account…'); await createUserWithEmailAndPassword(auth, email, password); }
-        catch (e) { setAuthStatus('error', friendlyError(e.code)); }
-      },
-
-      async logout() { await signOut(auth); },
-
-      scheduleSave(state) {
-        if (!auth?.currentUser) return;
-        clearTimeout(saveTimer);
-        setSyncIndicator('pending');
-        saveTimer = setTimeout(async () => {
-          try {
-            await set(ref(db, `users/${auth.currentUser.uid}/state`), state);
-            setSyncIndicator('saved');
-          } catch (e) { console.error('❌ Firebase save failed:', e.message); setSyncIndicator('error'); }
-        }, 1500);
-      },
-
-      async pullState() {
-        if (!auth?.currentUser) return null;
-        try {
-          const snap = await get(ref(db, `users/${auth.currentUser.uid}/state`));
-          return snap.exists() ? snap.val() : null;
-        } catch (e) { console.error('❌ Firebase pull failed:', e.message); return null; }
-      },
-    };
-
-    onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        document.getElementById('authOverlay').style.display = 'none';
-        document.getElementById('userEmailDisplay').textContent = user.email;
-        document.getElementById('syncUserRow').style.display   = 'flex';
-        setSyncIndicator('loading');
-
-        const cloudState = await window._firebase.pullState();
-        if (cloudState) {
-          // Firebase is source of truth — cloud state wins, never merge with localStorage
-          const merged = { ...window.DEFAULT_STATE, ...cloudState };
-          if (typeof window._syncStateRef === 'function') window._syncStateRef(merged);
-          localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
-        } else {
-          // New user — start completely fresh, ignore any stale localStorage
-          const freshState = { ...window.DEFAULT_STATE };
-          if (typeof window._syncStateRef === 'function') window._syncStateRef(freshState);
-          localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
-          window._firebase.scheduleSave(window.STATE);
-        }
-
-        setSyncIndicator('saved');
-        if (typeof window.updateTopBar       === 'function') window.updateTopBar();
-        if (typeof window.updateDashboard    === 'function') window.updateDashboard();
-        if (typeof window.renderLearnModules === 'function') window.renderLearnModules();
-
-        // Live listener — Firebase always wins
-          onValue(ref(db, `users/${user.uid}/state`), (snap) => {
-            if (!snap.exists()) return;
-            const remote = snap.val();
-            const current = window.STATE || {};
-            if (JSON.stringify(remote) !== JSON.stringify(current)) {
-              if (typeof window._syncStateRef === 'function')
-                window._syncStateRef({ ...window.DEFAULT_STATE, ...remote });
-              localStorage.setItem('espanol_state_v2', JSON.stringify(window.STATE));
-              if (typeof window.updateTopBar    === 'function') window.updateTopBar();
-              if (typeof window.updateDashboard === 'function') window.updateDashboard();
-              setSyncIndicator('saved');
-            }
-          });
-
-      } else {
-        document.getElementById('authOverlay').style.display = 'flex';
-        document.getElementById('syncUserRow').style.display = 'none';
-        document.getElementById('userEmailDisplay').textContent = '';
-      }
-    });
-  });
 </script>
 <style>
 :root {
@@ -1170,6 +1194,224 @@ body {
 .wotd-type { font-size: 0.8rem; color: var(--text3); font-style: italic; margin-bottom: 0.5rem; }
 .wotd-meaning { font-size: 1rem; color: var(--text2); }
 .wotd-example { font-size: 0.85rem; color: var(--text3); font-style: italic; margin-top: 0.5rem; }
+
+
+/* ===== CALENDAR VIEW ===== */
+.tt-cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 3px;
+  margin-bottom: 0.5rem;
+}
+.tt-cal-day-header {
+  text-align: center;
+  font-size: 0.7rem; font-weight: 800;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text3); padding: 0.4rem 0;
+}
+.tt-cal-cell {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-height: 72px;
+  padding: 0.4rem;
+  cursor: default;
+  transition: all 0.15s;
+  position: relative;
+  overflow: hidden;
+}
+.tt-cal-cell.study-day {
+  cursor: pointer;
+  border-color: rgba(245,200,66,0.2);
+}
+.tt-cal-cell.study-day:hover {
+  border-color: var(--accent);
+  background: rgba(245,200,66,0.05);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+}
+.tt-cal-cell.other-month { opacity: 0.3; }
+.tt-cal-cell.today-cell { border-color: var(--accent3) !important; box-shadow: 0 0 0 1px var(--accent3); }
+.tt-cal-cell.all-done { background: rgba(34,197,94,0.07); border-color: rgba(34,197,94,0.3); }
+.tt-cal-cell.partial-done { background: rgba(245,200,66,0.05); border-color: rgba(245,200,66,0.25); }
+.cal-date-num {
+  font-size: 0.75rem; font-weight: 700;
+  color: var(--text3); margin-bottom: 0.25rem;
+  display: block;
+}
+.cal-date-num.today-num { color: var(--accent3); }
+.cal-focus-label {
+  font-size: 0.68rem; font-weight: 600;
+  color: var(--text2); line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.cal-phase-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  display: inline-block; margin-right: 3px; flex-shrink: 0;
+}
+.cal-progress-dots {
+  display: flex; flex-wrap: wrap; gap: 2px; margin-top: 4px;
+}
+.cal-task-dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--border);
+}
+.cal-task-dot.done { background: var(--success); }
+.cal-week-label {
+  grid-column: 1 / -1;
+  font-size: 0.65rem; font-weight: 800;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--text3); padding: 0.6rem 0.25rem 0.15rem;
+}
+.cal-legend {
+  display: flex; flex-wrap: wrap; gap: 0.75rem;
+  margin-bottom: 1rem; font-size: 0.78rem; color: var(--text2);
+  align-items: center;
+}
+.cal-legend-item { display: flex; align-items: center; gap: 0.4rem; }
+.cal-detail-task {
+  display: flex; align-items: flex-start; gap: 0.6rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  font-size: 0.85rem; color: var(--text2);
+}
+.cal-detail-task:last-child { border-bottom: none; }
+.cal-detail-task input[type=checkbox] { margin-top:0.15rem; cursor:pointer; accent-color:var(--accent); flex-shrink:0; }
+.cal-detail-task.checked { text-decoration: line-through; color: var(--text3); }
+
+/* ===== TIMETABLE ===== */
+.timetable-header {
+  display: flex; align-items: center; gap: 1rem;
+  flex-wrap: wrap; margin-bottom: 1.5rem;
+}
+.phase-badge {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  font-size: 0.72rem; font-weight: 800;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 0.3rem 0.8rem; border-radius: 100px;
+}
+.tt-settings-bar {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+  display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: flex-end;
+}
+.tt-settings-bar label { font-size:0.72rem; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:var(--text3); display:block; margin-bottom:0.35rem; }
+.tt-settings-bar select, .tt-settings-bar input[type=number] {
+  background: var(--surface2); border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm); padding: 0.5rem 0.9rem;
+  color: var(--text); font-family: 'DM Sans', sans-serif;
+  font-size: 0.9rem; outline: none; cursor: pointer;
+  transition: border-color 0.2s;
+}
+.tt-settings-bar select:focus, .tt-settings-bar input[type=number]:focus { border-color: var(--accent); }
+.phase-block { margin-bottom: 2rem; }
+.phase-title {
+  display: flex; align-items: center; gap: 0.75rem;
+  font-family: 'Playfair Display', serif; font-size: 1.3rem;
+  margin-bottom: 1rem; padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.phase-title .phase-toggle { margin-left: auto; font-size: 1rem; color: var(--text3); transition: transform 0.3s; }
+.phase-title.collapsed .phase-toggle { transform: rotate(-90deg); }
+.week-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 1rem;
+  overflow: hidden;
+}
+.week-header {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 1rem 1.25rem; cursor: pointer;
+  transition: background 0.2s;
+}
+.week-header:hover { background: var(--surface2); }
+.week-num {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: var(--surface3); color: var(--text3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.7rem; font-weight: 800; flex-shrink: 0;
+}
+.week-num.done { background: rgba(34,197,94,0.15); color: var(--success); }
+.week-theme { font-weight: 600; font-size: 0.95rem; }
+.week-dates { margin-left: auto; font-size: 0.78rem; color: var(--text3); white-space: nowrap; }
+.week-prog { font-size: 0.75rem; color: var(--text3); margin-left: 0.5rem; white-space: nowrap; }
+.week-toggle { font-size: 0.9rem; color: var(--text3); transition: transform 0.25s; margin-left: 0.5rem; }
+.week-toggle.open { transform: rotate(180deg); }
+.week-body { display: none; padding: 0 1.25rem 1rem; border-top: 1px solid var(--border); }
+.week-body.open { display: block; }
+.day-row {
+  display: flex; align-items: flex-start; gap: 1rem;
+  padding: 0.85rem 0;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.day-row:last-child { border-bottom: none; }
+.day-label {
+  width: 90px; flex-shrink: 0;
+  font-size: 0.72rem; font-weight: 700;
+  color: var(--text3); padding-top: 0.2rem;
+  letter-spacing: 0.04em;
+}
+.day-content { flex: 1; }
+.day-focus {
+  font-size: 0.88rem; font-weight: 600;
+  color: var(--text); margin-bottom: 0.5rem;
+}
+.task-list { display: flex; flex-direction: column; gap: 0.3rem; }
+.task-item {
+  display: flex; align-items: flex-start; gap: 0.6rem;
+  font-size: 0.82rem; color: var(--text2);
+}
+.task-item input[type=checkbox] {
+  margin-top: 0.1rem; cursor: pointer; flex-shrink: 0;
+  accent-color: var(--accent); width: 14px; height: 14px;
+}
+.task-item.checked { text-decoration: line-through; color: var(--text3); }
+.tt-overall-bar {
+  background: var(--surface2); border-radius: 100px;
+  height: 10px; overflow: hidden; margin: 0.5rem 0 0.25rem;
+}
+.tt-overall-fill { height: 100%; border-radius: 100px; background: linear-gradient(90deg, var(--accent3), var(--accent)); transition: width 0.5s ease; }
+.checklist-section { margin-bottom: 2rem; }
+.checklist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.6rem; }
+.cl-item {
+  display: flex; align-items: center; gap: 0.7rem;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 0.65rem 0.9rem;
+  font-size: 0.85rem; cursor: pointer;
+  transition: all 0.2s;
+}
+.cl-item:hover { border-color: var(--accent); }
+.cl-item.cl-done { background: rgba(34,197,94,0.06); border-color: rgba(34,197,94,0.3); color: var(--text3); text-decoration: line-through; }
+.cl-item input[type=checkbox] { accent-color: var(--accent3); cursor: pointer; width: 15px; height: 15px; flex-shrink:0; }
+.tt-tab-btns { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; flex-wrap: wrap; }
+.tt-tab-btn {
+  padding: 0.55rem 1.2rem; border-radius: 100px; cursor: pointer;
+  font-size: 0.85rem; font-weight: 600; border: 1.5px solid var(--border);
+  background: transparent; color: var(--text2); transition: all 0.2s;
+}
+.tt-tab-btn.active { background: var(--accent); color: #0d0d14; border-color: var(--accent); }
+.exam-countdown {
+  background: linear-gradient(135deg, rgba(232,72,90,0.12), rgba(167,139,250,0.08));
+  border: 1px solid rgba(232,72,90,0.25);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+  display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;
+}
+.countdown-num {
+  font-family: 'Space Mono', monospace;
+  font-size: 2.5rem; font-weight: 700; color: var(--accent2);
+  line-height: 1;
+}
+.countdown-label { font-size: 0.75rem; color: var(--text3); text-transform: uppercase; letter-spacing: 0.08em; }
 </style>
 </head>
 <body>
@@ -1280,6 +1522,9 @@ body {
     </button>
     <button class="nav-tab" onclick="switchTab('progress')" id="tab-progress">
       <span class="tab-icon">📊</span> Progress
+    </button>
+    <button class="nav-tab" onclick="switchTab('timetable')" id="tab-timetable">
+      <span class="tab-icon">📅</span> Timetable
     </button>
   </nav>
 
@@ -1467,6 +1712,97 @@ body {
 
       <div style="height:1.5rem"></div>
       <button class="btn btn-outline" onclick="resetProgress()" style="color:var(--danger);border-color:var(--danger)">🗑️ Reset Progress</button>
+    </div>
+
+    <!-- ===== TIMETABLE TAB ===== -->
+    <div id="tab-content-timetable" class="tab-content">
+      <h2 class="section-title">📅 Study Timetable</h2>
+
+      <!-- Countdown banner -->
+      <div class="exam-countdown" id="ttCountdown"></div>
+
+      <!-- Sub-tabs -->
+      <div class="tt-tab-btns">
+        <button class="tt-tab-btn active" onclick="switchTTTab('schedule',this)">📆 Weekly Schedule</button>
+        <button class="tt-tab-btn" onclick="switchTTTab('checklist',this)">✅ Topic Checklist</button>
+        <button class="tt-tab-btn" onclick="switchTTTab('calendar',this)">🗓️ Calendar View</button>
+        <button class="tt-tab-btn" onclick="switchTTTab('settings',this)">⚙️ Settings</button>
+      </div>
+
+      <!-- Overall progress -->
+      <div id="ttOverallProgress" style="margin-bottom:1.5rem;"></div>
+
+      <!-- Schedule sub-tab -->
+      <div id="ttScheduleView">
+        <div id="ttPhasesContainer"></div>
+      </div>
+
+      <!-- Checklist sub-tab -->
+      <div id="ttChecklistView" style="display:none;">
+        <div id="ttChecklistContainer"></div>
+      </div>
+
+      <!-- Calendar sub-tab -->
+      <div id="ttCalendarView" style="display:none;">
+        <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;flex-wrap:wrap;">
+          <button class="btn btn-outline" onclick="ttCalPrev()" style="padding:0.45rem 1rem;">← Prev</button>
+          <div id="ttCalMonthLabel" style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;min-width:160px;text-align:center;"></div>
+          <button class="btn btn-outline" onclick="ttCalNext()" style="padding:0.45rem 1rem;">Next →</button>
+          <button class="btn btn-outline" onclick="ttCalToday()" style="padding:0.45rem 1rem;margin-left:auto;">Today</button>
+        </div>
+        <div id="ttCalGrid"></div>
+        <!-- Day detail panel -->
+        <div id="ttCalDetail" style="display:none;margin-top:1rem;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+            <div id="ttCalDetailTitle" style="font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;"></div>
+            <button onclick="document.getElementById('ttCalDetail').style.display='none'" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:1.2rem;">✕</button>
+          </div>
+          <div id="ttCalDetailBody"></div>
+        </div>
+      </div>
+
+      <!-- Settings sub-tab -->
+      <div id="ttSettingsView" style="display:none;">
+        <div class="tt-settings-bar" style="flex-direction:column;align-items:stretch;gap:1.5rem;">
+          <h3 style="font-family:'Playfair Display',serif;font-size:1.2rem;margin-bottom:0;">Customise Your Plan</h3>
+          <div style="display:flex;flex-wrap:wrap;gap:1.5rem;">
+            <div>
+              <label>Study days per week</label>
+              <select id="ttDaysPerWeek" onchange="saveTTSettings()">
+                <option value="3">3 days/week</option>
+                <option value="4">4 days/week</option>
+                <option value="5" selected>5 days/week</option>
+                <option value="6">6 days/week</option>
+                <option value="7">7 days/week</option>
+              </select>
+            </div>
+            <div>
+              <label>Daily study time</label>
+              <select id="ttDailyMins" onchange="saveTTSettings()">
+                <option value="30">30 minutes</option>
+                <option value="45" selected>45 minutes</option>
+                <option value="60">1 hour</option>
+                <option value="90">1.5 hours</option>
+                <option value="120">2 hours</option>
+              </select>
+            </div>
+            <div>
+              <label>Exam date</label>
+              <input type="date" id="ttExamDate" value="2026-10-01" onchange="saveTTSettings()" style="background:var(--surface2);border:1.5px solid var(--border);border-radius:var(--radius-sm);padding:0.5rem 0.9rem;color:var(--text);font-family:'DM Sans',sans-serif;font-size:0.9rem;outline:none;" />
+            </div>
+          </div>
+          <div>
+            <label>Study reminder note (personal motivation)</label>
+            <textarea id="ttMotivation" rows="3" placeholder="e.g. Every day of Spanish practice is one step closer to that DELE A2 certificate! 🌟"
+              onchange="saveTTSettings()"
+              style="background:var(--surface2);border:1.5px solid var(--border);border-radius:var(--radius-sm);padding:0.75rem 1rem;color:var(--text);font-family:'DM Sans',sans-serif;font-size:0.9rem;outline:none;width:100%;resize:vertical;transition:border-color 0.2s;"></textarea>
+          </div>
+          <div>
+            <button class="btn btn-outline" onclick="resetTTProgress()" style="color:var(--danger);border-color:var(--danger);">🗑️ Reset timetable progress</button>
+          </div>
+        </div>
+      </div>
+
     </div>
 
   </main>
@@ -3105,6 +3441,797 @@ function confetti() {
     setTimeout(() => c.remove(), 3000);
   }
 }
+
+
+// =========================================
+// TIMETABLE & CHECKLIST
+// =========================================
+
+const STUDY_PLAN = [
+  { phase:1, phaseName:"Phase 1 — Foundations", color:"var(--accent3)", icon:"🌱",
+    weeks:[
+      { weekNum:1, theme:"Greetings, Alphabet & Dates", icon:"👋", dates:"May 1–7",
+        days:[
+          { label:"Thu 1 May", focus:"Greetings & introductions", tasks:["Hola / Buenos días/tardes/noches","¿Cómo te llamas? / Me llamo…","Nationalities & languages","¿Cómo estás? / Bien, gracias"] },
+          { label:"Fri 2 May", focus:"Alphabet & pronunciation", tasks:["Spanish 27-letter alphabet","Sounds: ñ, ll, rr, j, h","Accent marks: á é í ó ú","Pronounce 10 words aloud"] },
+          { label:"Sat 3 May", focus:"Numbers 1–50", tasks:["Cardinal 1–20","21–50 numbers","Ordinals: primero, segundo…","Say your phone number in Spanish"] },
+          { label:"Mon 5 May", focus:"Numbers 51–1000 & Time", tasks:["51–100 & hundreds","¿Qué hora es? telling time","Cuarto, media, menos cuarto","Write 5 times in Spanish"] },
+          { label:"Wed 7 May", focus:"Days, Months & Dates", tasks:["Days: lunes–domingo","Months: enero–diciembre","¿Qué día es hoy? / ¿Cuándo es?","Write today's full date in Spanish"] }
+        ]
+      },
+      { weekNum:2, theme:"Articles, Nouns & Gender", icon:"📖", dates:"May 8–14",
+        days:[
+          { label:"Thu 8 May", focus:"Definite articles", tasks:["El / la / los / las rules","Masculine vs feminine nouns","Exceptions (el agua, la mano)","Match 20 nouns with article"] },
+          { label:"Fri 9 May", focus:"Indefinite articles & plurals", tasks:["Un / una / unos / unas","Forming plurals: -s and -es","Nouns ending in consonant","Singular → plural practice"] },
+          { label:"Sat 10 May", focus:"Adjectives & agreement", tasks:["Endings: -o/-a/-os/-as","Adjectives that don't change","Position before/after noun","Describe 5 people with adjectives"] },
+          { label:"Mon 12 May", focus:"Subject pronouns", tasks:["Yo, tú, él/ella, usted, nosotros, vosotros, ellos/ustedes","Tú vs usted (when to use)","Vosotros vs ustedes","Conjugate hablar with all pronouns"] },
+          { label:"Wed 14 May", focus:"Revision + Mini Quiz", tasks:["Review articles, plurals, adjectives","Self-test: 10 fill-in-blank questions","Review 30 new words this week","Mark weak spots for extra practice"] }
+        ]
+      },
+      { weekNum:3, theme:"Ser vs Estar & Present Tense", icon:"🎭", dates:"May 15–21",
+        days:[
+          { label:"Thu 15 May", focus:"Ser — identity & characteristics", tasks:["Ser for origin, profession, identity","Ser conjugation (present)","Descriptions that don't change","Write 5 sentences using ser"] },
+          { label:"Fri 16 May", focus:"Estar — state & location", tasks:["Estar for location, emotions, states","Estar conjugation (present)","Estar + adjective: está cansada","Write 5 sentences using estar"] },
+          { label:"Sat 17 May", focus:"Ser vs Estar contrast", tasks:["PLACE rule for estar","Tricky pairs: es/está aburrido","10 ser/estar contrast questions","Flashcard review of both verbs"] },
+          { label:"Mon 19 May", focus:"Present tense -AR verbs", tasks:["Endings: -o, -as, -a, -amos, -áis, -an","Hablar, trabajar, escuchar, cocinar","Conjugate 5 -AR verbs fully","Write 3 daily routine sentences"] },
+          { label:"Wed 21 May", focus:"Present tense -ER & -IR verbs", tasks:["ER endings: -o,-es,-e,-emos,-éis,-en","IR endings: -o,-es,-e,-imos,-ís,-en","Comer, beber, vivir, escribir","Mixed conjugation drill: 10 verbs"] }
+        ]
+      },
+      { weekNum:4, theme:"Irregular Present Verbs", icon:"⚡", dates:"May 22–28",
+        days:[
+          { label:"Thu 22 May", focus:"Tener & Haber/Hay", tasks:["Tener conjugation (tengo, tienes…)","Tener + noun: tengo hambre/frío","Hay vs está/están","Describe what's in your room"] },
+          { label:"Fri 23 May", focus:"Ir & Venir", tasks:["Ir: voy, vas, va, vamos, vais, van","Ir + a + infinitive: voy a estudiar","Venir: vengo, vienes, viene…","Directions using ir"] },
+          { label:"Sat 24 May", focus:"Poder, Querer & Deber", tasks:["Stem-change o→ue (poder, volver)","Stem-change e→ie (querer, preferir)","Deber + infinitive (obligation)","Write 5 modal sentences"] },
+          { label:"Mon 26 May", focus:"Hacer, Poner, Salir, Decir", tasks:["Hacer yo-form: hago","Poner, salir, traer — yo forms","Decir: digo, dices, dice…","20-verb rapid conjugation drill"] },
+          { label:"Wed 28 May", focus:"Revision + Quiz", tasks:["Review all irregular present verbs","Translate 10 English → Spanish","30 new verbs this week","15-min flashcard review"] }
+        ]
+      },
+      { weekNum:5, theme:"Reflexive Verbs & Gustar", icon:"🔄", dates:"May 29–Jun 4",
+        days:[
+          { label:"Thu 29 May", focus:"Reflexive pronouns", tasks:["Me, te, se, nos, os, se","Position before conjugated verb","Levantarse, ducharse, vestirse","5 morning routine sentences"] },
+          { label:"Fri 30 May", focus:"Daily routine vocabulary", tasks:["Despertarse, ducharse, desayunar…","Ir al trabajo, comer, cenar, acostarse","Time phrases: por la mañana, a las 8","Write a full daily routine paragraph"] },
+          { label:"Sat 31 May", focus:"Gustar & similar verbs", tasks:["Me gusta / me gustan","Encantar, odiar, molestar, doler","Indirect pronouns: me/te/le/nos/os/les","Write 5 things you like/dislike"] },
+          { label:"Mon 2 Jun", focus:"Possessives", tasks:["Mi/tu/su/nuestro/vuestro/su","Agreement with noun gender/number","Este/ese/aquel (demonstratives)","Describe family using possessives"] },
+          { label:"Wed 4 Jun", focus:"Reading: Daily routine text", tasks:["Read a short Spanish daily routine text","Answer 5 comprehension questions","Extract 10 new vocabulary items","Review all words from this week"] }
+        ]
+      },
+      { weekNum:6, theme:"Family, Home & Adjectives", icon:"🏠", dates:"Jun 5–11",
+        days:[
+          { label:"Thu 5 Jun", focus:"Family vocabulary", tasks:["Padres, hermanos, abuelos, tíos","Esposo/esposa, hijo/hija, primo/a","Describe your family in 5 sentences","Family tree: label in Spanish"] },
+          { label:"Fri 6 Jun", focus:"Home & furniture", tasks:["Rooms: dormitorio, salón, cocina, baño","Furniture: cama, sofá, mesa, armario","Prepositions: encima, debajo, al lado","Describe your bedroom in Spanish"] },
+          { label:"Sat 7 Jun", focus:"Personality & appearance", tasks:["Personality: simpático, trabajador, vago","Appearance: alto/bajo, joven/viejo","Hair & eyes: pelo rubio, ojos marrones","Describe a family member fully"] },
+          { label:"Mon 9 Jun", focus:"Comparatives & superlatives", tasks:["Más … que / menos … que","Tan … como (as … as)","El más/menos + adjective","5 comparison sentences"] },
+          { label:"Wed 11 Jun", focus:"Writing: Mi familia", tasks:["Write 80 words: Mi familia","Review comparatives and adjectives","Vocabulary quiz: family & home","30 flashcard review"] }
+        ]
+      },
+      { weekNum:7, theme:"Food, Restaurants & Quantities", icon:"🥗", dates:"Jun 12–18",
+        days:[
+          { label:"Thu 12 Jun", focus:"Food vocabulary", tasks:["Fruits, vegetables, meat & fish","La carne, el pescado, las verduras","Dairy, bread, drinks","Read a Spanish restaurant menu"] },
+          { label:"Fri 13 Jun", focus:"Ordering in a restaurant", tasks:["Quiero / quisiera / me pone…","¿Qué recomienda? / La carta","De primero / de segundo / de postre","Role-play: order a 3-course meal"] },
+          { label:"Sat 14 Jun", focus:"Quantities & shopping", tasks:["Un kilo de, una botella de, un poco de","Mucho/poco/bastante/demasiado","¿Cuánto cuesta? / ¿Cuánto es?","Write a shopping list in Spanish"] },
+          { label:"Mon 16 Jun", focus:"Drinks & café culture", tasks:["Café solo, cortado, con leche, té, zumo","Ordering: ¿Me pone un café?","Vino tinto/blanco, agua con gas/sin gas","20 drinks and food vocabulary items"] },
+          { label:"Wed 18 Jun", focus:"Listening: restaurant dialogue", tasks:["Listen to restaurant conversation","Complete gap-fill exercise","Pronounce food vocabulary aloud","Weekly vocab quiz (40 words)"] }
+        ]
+      }
+    ]
+  },
+  { phase:2, phaseName:"Phase 2 — Building Tenses", color:"var(--accent)", icon:"⏳",
+    weeks:[
+      { weekNum:8, theme:"Places, Transport & Directions", icon:"🏙️", dates:"Jun 19–25",
+        days:[
+          { label:"Thu 19 Jun", focus:"Places in town", tasks:["El banco, la farmacia, el supermercado","La estación, el aeropuerto, la parada","¿Dónde está…? / Está a dos calles","Label a Spanish town map"] },
+          { label:"Fri 20 Jun", focus:"Transport vocabulary", tasks:["Metro, tren, autobús, avión, taxi","Billete de ida / de ida y vuelta","¿A qué hora sale/llega el tren?","Practice booking dialogue"] },
+          { label:"Sat 21 Jun", focus:"Giving directions", tasks:["Todo recto, girar a la derecha/izquierda","Cruzar, pasar, doblar la esquina","Cerca/lejos, a 5 minutos andando","Write directions from school to home"] },
+          { label:"Mon 23 Jun", focus:"Prepositions of place", tasks:["En, a, de, desde, hasta, entre","Al lado de, enfrente de, encima de","10 location sentences","Describe object positions in a picture"] },
+          { label:"Wed 25 Jun", focus:"Reading + transport test", tasks:["Read a Spanish map/transport text","5 comprehension questions","Vocab review: places & transport","Prepare for preterite tense"] }
+        ]
+      },
+      { weekNum:9, theme:"Preterite Tense — Regular", icon:"⏳", dates:"Jun 26–Jul 2",
+        days:[
+          { label:"Thu 26 Jun", focus:"-AR preterite endings", tasks:["Endings: -é,-aste,-ó,-amos,-asteis,-aron","Hablar, llegar, tomar, trabajar, comprar","Conjugate 5 -AR verbs in preterite","3 sentences about yesterday"] },
+          { label:"Fri 27 Jun", focus:"-ER/-IR preterite endings", tasks:["Endings: -í,-iste,-ió,-imos,-isteis,-ieron","Comer, beber, vivir, salir, escribir","Conjugate 5 ER/IR verbs in preterite","Timeline: my week in preterite"] },
+          { label:"Sat 28 Jun", focus:"Preterite time markers", tasks:["Ayer, anteayer, la semana pasada","El lunes, hace dos días, hace un mes","En + year: en 2022","Write about last weekend"] },
+          { label:"Mon 30 Jun", focus:"Preterite vs present", tasks:["Hoy como pizza / Ayer comí pizza","Choose correct tense: 10 sentences","Error correction exercise","Preterite rapid conjugation drill"] },
+          { label:"Wed 2 Jul", focus:"Writing: El fin de semana pasado", tasks:["Write 80 words about last weekend","Review regular preterite","30 past-time vocabulary words","Flashcard review session"] }
+        ]
+      },
+      { weekNum:10, theme:"Preterite — Irregular Verbs", icon:"🌀", dates:"Jul 3–9",
+        days:[
+          { label:"Thu 3 Jul", focus:"Totally irregular preterites", tasks:["Ser/ir → fui, fuiste, fue, fuimos…","Tener → tuve, tuviste, tuvo…","Estar → estuve, estuviste, estuvo…","Hacer → hice, hiciste, hizo…"] },
+          { label:"Fri 4 Jul", focus:"More irregular preterites", tasks:["Poder → pude / Querer → quise","Venir → vine / Decir → dije","Traer → traje / Poner → puse","Rapid drill: 10 irregular forms"] },
+          { label:"Sat 5 Jul", focus:"Spelling-change preterites", tasks:["Llegar → llegué (g→gu)","Empezar → empecé (z→c)","Buscar → busqué (c→qu)","Leer/creer: leyó, creyó (y form)"] },
+          { label:"Mon 7 Jul", focus:"Preterite storytelling", tasks:["Un día en mi vida (past narrative)","Use 8+ irregular preterite verbs","Read a short preterite story","Find and translate all preterite verbs"] },
+          { label:"Wed 9 Jul", focus:"20-question preterite test", tasks:["Regular + irregular preterite test","Review spelling changes","25 action verbs vocabulary","Prepare for imperfect tense"] }
+        ]
+      },
+      { weekNum:11, theme:"Imperfect Tense", icon:"📽️", dates:"Jul 10–16",
+        days:[
+          { label:"Thu 10 Jul", focus:"Imperfect -AR endings", tasks:["Endings: -aba,-abas,-aba,-ábamos,-abais,-aban","Hablar, vivir, comer, jugar","Conjugate 5 verbs in imperfect","Childhood memories with 'antes'"] },
+          { label:"Fri 11 Jul", focus:"Imperfect -ER/-IR + irregulars", tasks:["Endings: -ía,-ías,-ía,-íamos,-íais,-ían","Only 3 irregulars: ser (era), ir (iba), ver (veía)","Conjugate ser, ir, ver fully","Describe life before (antes de)"] },
+          { label:"Sat 12 Jul", focus:"Imperfect time markers", tasks:["Antes, siempre, normalmente, todos los días","De niño/a, cuando era pequeño/a","A veces, de vez en cuando","Write: De pequeña, yo siempre…"] },
+          { label:"Mon 14 Jul", focus:"Preterite vs Imperfect", tasks:["Imperfect = background/habit","Preterite = completed action","Choose correct tense: 10 exercises","Contrast writing: then vs now"] },
+          { label:"Wed 16 Jul", focus:"Writing: Mi infancia", tasks:["Write 100 words about your childhood","5 imperfect + 3 preterite verbs minimum","Childhood vocabulary: jugar, amigos","Flashcard review"] }
+        ]
+      },
+      { weekNum:12, theme:"Health, Body & Emotions", icon:"🏥", dates:"Jul 17–23",
+        days:[
+          { label:"Thu 17 Jul", focus:"Body vocabulary", tasks:["Head to toe: cabeza, cuello, hombros, pecho","Estómago, espalda, brazo, pierna","Mano, pie, rodilla, codo","Label body diagram in Spanish"] },
+          { label:"Fri 18 Jul", focus:"Illnesses & symptoms", tasks:["Tengo fiebre, tos, dolor de cabeza, gripe","Me duele la garganta / me duelen los pies","Estoy mareado/a, cansado/a, enfermo/a","At the doctor: role-play dialogue"] },
+          { label:"Sat 19 Jul", focus:"Emotions vocabulary", tasks:["Contento, triste, nervioso, asustado","Estar enamorado/a, sorprendido, preocupado","¿Cómo te sientes? describing feelings","Write: Cómo me siento hoy y por qué"] },
+          { label:"Mon 21 Jul", focus:"At the pharmacy", tasks:["Receta, pastilla, jarabe, vendaje","¿Qué le pasa? Me duele + body part","¿Tiene alergia a…? / ¿Toma medicamentos?","Reading: pharmacy conversation text"] },
+          { label:"Wed 23 Jul", focus:"Listening + health quiz", tasks:["Listen to health-themed dialogue","5 comprehension questions","40-word health/body vocabulary quiz","Review: estar + adjective for emotions"] }
+        ]
+      },
+      { weekNum:13, theme:"Shopping, Hobbies & Future Plans", icon:"🛍️", dates:"Jul 24–30",
+        days:[
+          { label:"Thu 24 Jul", focus:"Clothes & shopping", tasks:["Camisa, falda, vestido, pantalón, zapatos","¿Cuánto cuesta? / ¿Tiene una talla más?","Colours review (add: beige, granate)","Describe your outfit in Spanish"] },
+          { label:"Fri 25 Jul", focus:"Money & transactions", tasks:["El precio, el descuento, la oferta","Pagar con tarjeta / en efectivo","¿Me puede dar la cuenta? / ¿Tiene cambio?","Write a shopping dialogue"] },
+          { label:"Sat 26 Jul", focus:"Future: ir + a + infinitive", tasks:["Voy a / vas a / va a + infinitive","Esta tarde, mañana, la semana que viene","Writing 5 plans for the coming week","Compare: present vs ir + a future"] },
+          { label:"Mon 28 Jul", focus:"Sports & hobbies", tasks:["Jugar al fútbol/tenis/baloncesto","Hacer natación, yoga, atletismo","¿A qué juegas? / ¿Cuánto tiempo llevas…?","Describe your hobbies in 50 words"] },
+          { label:"Wed 30 Jul", focus:"Phase 2 checkpoint", tasks:["Full tense review: present, preterite, imperfect","Mixed tense test: 20 questions","50-word speed vocabulary review","Rate confidence in each topic 1–5"] }
+        ]
+      }
+    ]
+  },
+  { phase:3, phaseName:"Phase 3 — Advanced Skills", color:"var(--accent4)", icon:"🧠",
+    weeks:[
+      { weekNum:14, theme:"Future & Conditional Tenses", icon:"🔮", dates:"Jul 31–Aug 6",
+        days:[
+          { label:"Thu 31 Jul", focus:"Simple future tense", tasks:["Endings: -é,-ás,-á,-emos,-éis,-án","Regular: hablaré, comeré, viviré","Irregular roots: tendré, vendré, haré, podré","Write 5 predictions for next year"] },
+          { label:"Fri 1 Aug", focus:"Irregular future verbs", tasks:["Salir→saldré, Poner→pondré","Decir→diré, Hacer→haré, Tener→tendré","12 irregular future forms drill","Context: weather forecasts in Spanish"] },
+          { label:"Sat 2 Aug", focus:"Conditional tense intro", tasks:["Endings: -ía,-ías,-ía,-íamos,-íais,-ían","Same irregulars as future","Si tuviera dinero, viajaría a…","Write 3 conditional wish sentences"] },
+          { label:"Mon 4 Aug", focus:"Future vs conditional", tasks:["Future = will / Conditional = would","Promesas: Te llamaré mañana","Deseos: Me gustaría aprender chino","10 translation sentences (mix)"] },
+          { label:"Wed 6 Aug", focus:"Writing: El futuro", tasks:["100 words: ¿Cómo será tu vida en 10 años?","Use at least 6 future verbs","Future time expression vocabulary","Flashcard review session"] }
+        ]
+      },
+      { weekNum:15, theme:"Work, Study & Formal Language", icon:"💼", dates:"Aug 7–13",
+        days:[
+          { label:"Thu 7 Aug", focus:"Professions vocabulary", tasks:["Médico/a, abogado/a, profesor/a, ingeniero/a","¿A qué te dedicas? / Soy estudiante","Trabajo de enfermera / dependiente","Write: Mi profesión ideal y por qué"] },
+          { label:"Fri 8 Aug", focus:"Workplace & education", tasks:["La oficina, la reunión, el ordenador","Las asignaturas: matemáticas, historia","El examen, suspender/aprobar, la nota","Describe your work/study schedule"] },
+          { label:"Sat 9 Aug", focus:"Formal register", tasks:["Usted vs tú — when to switch","Formal writing: Me dirijo a usted…","Estimado/a señor/a… Le saluda atentamente","Write a formal email introduction"] },
+          { label:"Mon 11 Aug", focus:"Connectors & discourse markers", tasks:["Reason: porque, ya que, puesto que","Contrast: sin embargo, pero, aunque","Addition: además, también, por otro lado","Rewrite 5 sentences with connectors"] },
+          { label:"Wed 13 Aug", focus:"Reading: formal text", tasks:["Read a formal Spanish letter/email","Identify key info & register features","Answer comprehension questions","Workplace & formal expressions vocabulary"] }
+        ]
+      },
+      { weekNum:16, theme:"Environment, Media & Relative Clauses", icon:"🌍", dates:"Aug 14–20",
+        days:[
+          { label:"Thu 14 Aug", focus:"Weather & environment", tasks:["Sol, lluvia, nieve, viento, nubes","Hace calor/frío, está nublado, hay niebla","El medio ambiente, la contaminación","Write a 3-day weather forecast"] },
+          { label:"Fri 15 Aug", focus:"Media vocabulary", tasks:["Televisión, radio, periódico, revista","Las noticias, el reportaje, el documental","Redes sociales, el blog, aplicaciones","Describe your media habits in 50 words"] },
+          { label:"Sat 16 Aug", focus:"Relative clauses", tasks:["Que (that/which/who) — most common","Quien/quienes (who — people only)","Donde (where) for places","Join 5 sentence pairs with que/quien/donde"] },
+          { label:"Mon 18 Aug", focus:"Passive with se", tasks:["Se habla español en muchos países","Se vende, se alquila, se busca","Se prohíbe fumar / se ruega silencio","Create 5 notices/signs using se"] },
+          { label:"Wed 20 Aug", focus:"DELE A2 reading practice", tasks:["Read a news article in Spanish","Identify main idea and key details","Context clues for unknown vocabulary","DELE A2 reading task format practice"] }
+        ]
+      },
+      { weekNum:17, theme:"Subjunctive Mood", icon:"🧩", dates:"Aug 21–27",
+        days:[
+          { label:"Thu 21 Aug", focus:"Subjunctive introduction", tasks:["When is the subjunctive used?","-AR subjunctive: -e,-es,-e,-emos,-éis,-en","-ER/-IR subjunctive: -a,-as,-a,-amos,-áis,-an","Irregular: sea, esté, vaya, haya, sepa"] },
+          { label:"Fri 22 Aug", focus:"Subjunctive with querer/esperar", tasks:["Quiero que + subjunctive (different subjects)","Espero que tengas suerte","Necesito que vengas pronto","Write 5 sentences with quiero que…"] },
+          { label:"Sat 23 Aug", focus:"Subjunctive with emotions", tasks:["Me alegra que estés bien","Es posible que llueva mañana","No creo que sea verdad","Ojalá + subjunctive (wishes)"] },
+          { label:"Mon 25 Aug", focus:"Advanced connectors for writing", tasks:["A pesar de (despite), aunque + subj/ind","Para que + subjunctive (purpose)","En cuanto, cuando + subj (future)","Rewrite paragraph upgrading connectors"] },
+          { label:"Wed 27 Aug", focus:"Opinion essay: redes sociales", tasks:["Write 100 words on social media pros/cons","Use subjunctive at least twice","Use 3+ complex connectors","Self-review with writing checklist"] }
+        ]
+      },
+      { weekNum:18, theme:"Periphrases & Advanced Vocab", icon:"🔧", dates:"Aug 28–Sep 3",
+        days:[
+          { label:"Thu 28 Aug", focus:"Core verbal periphrases", tasks:["Estar + gerundio: estoy comiendo","Ir a + infinitivo: voy a salir","Acabar de + infinitivo: acabo de llegar","10 sentences using all three periphrases"] },
+          { label:"Fri 29 Aug", focus:"More periphrases", tasks:["Tener que + inf (obligation)","Hay que + inf (impersonal obligation)","Llevar + gerundio: llevo 2 horas estudiando","Seguir + gerundio: sigo aprendiendo"] },
+          { label:"Sat 30 Aug", focus:"Numbers & quantities advanced", tasks:["Fractions: la mitad, un tercio, un cuarto","Percentages: el 50%, la mayoría","Approximations: unos veinte, alrededor de","Interpret a Spanish-language graph"] },
+          { label:"Mon 1 Sep", focus:"Countries, nationalities & languages", tasks:["Spanish-speaking countries & capitals","Nationalities: español/a, francés/francesa","Hablar + language: hablo hindi, estudio español","Cultural knowledge for DELE exam"] },
+          { label:"Wed 3 Sep", focus:"Listening + vocabulary sprint", tasks:["Listen to 2 short Spanish dialogues","Answer comprehension questions","Sprint review of all vocabulary topics","Make personal weak-word list (20 words)"] }
+        ]
+      }
+    ]
+  },
+  { phase:4, phaseName:"Phase 4 — Revision & Exam Prep", color:"var(--accent2)", icon:"🎯",
+    weeks:[
+      { weekNum:19, theme:"Full Grammar Review — Part 1", icon:"📋", dates:"Sep 4–10",
+        days:[
+          { label:"Thu 4 Sep", focus:"Present tense revision", tasks:["Conjugate 20 verbs (regular + irregular)","Ser vs Estar: 10 sentence practice","Reflexive verbs: 5 routine sentences","Rate confidence 1–5 for each verb type"] },
+          { label:"Fri 5 Sep", focus:"Past tenses revision", tasks:["Preterite: 10-verb conjugation speed drill","Imperfect: 10-verb conjugation speed drill","Choose the correct tense: 15 sentences","Preterite vs imperfect paragraph correction"] },
+          { label:"Sat 6 Sep", focus:"Future & conditional revision", tasks:["Future: 10 regular + 6 irregular verbs","Conditional: 10 regular + 6 irregular","Translate 5 English sentences → Spanish","Plans (future) & dreams (conditional)"] },
+          { label:"Mon 8 Sep", focus:"Subjunctive & periphrases", tasks:["Subjunctive: 8 sentences with triggers","Periphrases: rewrite 6 sentences","Error correction: 10 grammar mistakes","Tip: mix tenses in all writing tasks"] },
+          { label:"Wed 10 Sep", focus:"Vocabulary mega-review", tasks:["All 15 vocabulary categories","Fill-in-blank: 30 vocabulary sentences","100 flashcards in 20 minutes","Weak-word priority list (20 words)"] }
+        ]
+      },
+      { weekNum:20, theme:"Full Grammar Review — Part 2", icon:"📋", dates:"Sep 11–17",
+        days:[
+          { label:"Thu 11 Sep", focus:"Nouns, articles & adjectives", tasks:["Gender rules: 15 tricky nouns","Plural forms: 10 irregular plurals","Adjective agreement: 15 sentences","Physical + personality description"] },
+          { label:"Fri 12 Sep", focus:"Pronouns full review", tasks:["Subject, reflexive, direct & indirect objects","Double object pronouns: se lo doy","Pronoun placement rules","Replace 10 nouns with pronouns"] },
+          { label:"Sat 13 Sep", focus:"Questions & negation", tasks:["¿Qué? ¿Quién? ¿Dónde? ¿Cuándo? ¿Cómo? ¿Por qué? ¿Cuál?","No + verb + nada/nadie/nunca","Tampoco vs también","Convert 10 statements to questions + negatives"] },
+          { label:"Mon 15 Sep", focus:"Writing practice", tasks:["Write 120 words: Una experiencia importante","Use 3+ different tenses","Include: creo que, pienso que","Check: connectors, spelling, agreement"] },
+          { label:"Wed 17 Sep", focus:"Listening comprehension strategies", tasks:["DELE A2 listening format overview","Gist vs specific information strategies","2 DELE-style listening exercises","Review weak vocabulary from the week"] }
+        ]
+      },
+      { weekNum:21, theme:"Mock Exams", icon:"📝", dates:"Sep 18–24",
+        days:[
+          { label:"Thu 18 Sep", focus:"Mock Exam 1 — Reading & Vocab", tasks:["Full DELE A2 reading: 45 min timed","No dictionary during exam","Mark all answers after time is up","Error log: note every mistake + reason"] },
+          { label:"Fri 19 Sep", focus:"Mock Exam 1 Review", tasks:["Go through every answer carefully","Research every error: understand the rule","Redo all incorrect questions from scratch","Priority revision: top 5 weak areas"] },
+          { label:"Sat 20 Sep", focus:"Mock Exam 2 — Listening & Grammar", tasks:["Listening section: 30 min timed","Grammar section: 30 min timed","No pausing or rewinding for listening","Error log: listening vs grammar comparison"] },
+          { label:"Mon 22 Sep", focus:"Mock Exam 2 Review + Writing", tasks:["Review Mock Exam 2 answers in detail","Timed writing: 80 words in 25 minutes","Self-assess against DELE A2 criteria","Write improved version after reflection"] },
+          { label:"Wed 24 Sep", focus:"Mock Exam 3 — Full simulation", tasks:["Complete full mock in exam conditions","Reading + Listening + Writing back to back","No breaks or phone during exam","Calculate score and assess readiness"] }
+        ]
+      },
+      { weekNum:22, theme:"Final Revision & Exam Day", icon:"🏁", dates:"Sep 25–Oct 1",
+        days:[
+          { label:"Thu 25 Sep", focus:"Targeted weak areas review", tasks:["Revisit top 3 grammar weak points","Vocabulary: practise 50 priority words","Read one short Spanish article","Write 5 sentences on each weak area"] },
+          { label:"Fri 26 Sep", focus:"Writing exam strategy", tasks:["DELE A2 writing rubric: what examiners check","Timed writing: 80 words in 20 minutes","Show vocab range and accuracy","Final checklist of writing tips"] },
+          { label:"Sat 27 Sep", focus:"Listening & reading strategies", tasks:["Read questions BEFORE listening/reading text","Keywords in questions → match in text","Time management: don't over-focus","1 reading + 1 listening exercise"] },
+          { label:"Mon 29 Sep", focus:"Light review & confidence day", tasks:["Read your best summary notes (30 min)","Flashcard vocabulary only (30 min)","Speak aloud: introduce yourself fully","Sleep well, pack documents, know location"] },
+          { label:"Wed 1 Oct", focus:"🎓 EXAM DAY — ¡Buena suerte, Khushi!", tasks:["Arrive 20+ minutes before start time","Bring: ID, exam confirmation, 2 pens","Stay calm — 5 months of preparation!","¡Tú puedes! ⭐ Orgullosa de ti misma"] }
+        ]
+      }
+    ]
+  }
+];
+
+const TOPIC_CHECKLIST = {
+  "🔤 Grammar": [
+    "Articles & gender (el/la/los/las)","Noun plurals","Adjective agreement","Subject pronouns",
+    "Ser (conjugation + uses)","Estar (conjugation + uses)","Ser vs Estar","Present tense -AR verbs",
+    "Present tense -ER/-IR verbs","Irregular present: tener, ir, ser, hacer","Stem-change verbs (e→ie, o→ue)",
+    "Reflexive verbs","Gustar & similar verbs","Possessives","Demonstratives",
+    "Preterite -AR (regular)","Preterite -ER/-IR (regular)","Irregular preterites (ser/ir/tener…)",
+    "Spelling-change preterites","Imperfect tense -AR","Imperfect tense -ER/-IR","3 irregular imperfects (ser/ir/ver)",
+    "Preterite vs Imperfect","Future tense (regular)","Future tense (irregular)","Conditional tense",
+    "Ir + a + infinitive (near future)","Subjunctive present (intro)","Relative clauses (que/quien/donde)",
+    "Passive with se","Comparatives & superlatives","Negation (nada/nadie/nunca)","Question words",
+    "Periphrases: estar + gerundio","Periphrases: acabar de + inf","Periphrases: tener que + inf",
+    "Connectors: reason, contrast, addition","Direct & indirect object pronouns","Formal register (usted)"
+  ],
+  "📚 Vocabulary Topics": [
+    "Greetings & introductions","Numbers 1–1000","Days, months & dates","Telling the time",
+    "Family members","Home & furniture","Personality adjectives","Appearance adjectives",
+    "Food & drink","Restaurant phrases","Quantities & shopping","Clothes & colours",
+    "Places in town","Transport","Directions","Health & body","Illnesses & symptoms",
+    "Emotions & feelings","Professions","Workplace & education","Sports & hobbies",
+    "Weather & seasons","Environment","Media & technology","Countries & nationalities",
+    "Numbers & fractions (advanced)","Past time expressions","Future time expressions"
+  ],
+  "🎧 Listening Skills": [
+    "Following basic conversations","Understanding telephone messages","Grasping gist of short announcements",
+    "Following directions by audio","Identifying key info in dialogues","Understanding weather forecasts",
+    "Following a simple story in Spanish","Recognising different accents","DELE A2 listening task format"
+  ],
+  "📖 Reading Skills": [
+    "Reading short notices and signs","Following simple instructions","Understanding personal emails",
+    "Reading short newspaper articles","Extracting specific information","Scanning for key words",
+    "Understanding timetables and menus","Reading simple narrative texts","DELE A2 reading task format"
+  ],
+  "✍️ Writing Skills": [
+    "Writing a personal email (informal)","Writing a formal email/letter","Describing yourself and family",
+    "Narrating a past event","Describing daily routines","Writing about future plans",
+    "Expressing opinions with reasons","Using connectors effectively","Checking agreement & spelling",
+    "DELE A2 written expression format (80–100 words)"
+  ],
+  "🗣️ Speaking Skills": [
+    "Self-introduction fluently","Describing a photo or image","Talking about daily routine",
+    "Asking for and giving directions","Ordering in a café/restaurant","Discussing likes and dislikes",
+    "Talking about past experiences","Expressing plans for the future","Role-playing common situations",
+    "DELE A2 oral expression format"
+  ]
+};
+
+// ── State keys for timetable ──────────────────────────────────────────────────
+function getTTState() {
+  try {
+    const raw = localStorage.getItem('espanol_tt_v1');
+    return raw ? JSON.parse(raw) : { tasks:{}, checklist:{}, settings:{ daysPerWeek:5, dailyMins:45, examDate:'2026-10-01', motivation:'' } };
+  } catch { return { tasks:{}, checklist:{}, settings:{ daysPerWeek:5, dailyMins:45, examDate:'2026-10-01', motivation:'' } }; }
+}
+function saveTTState(st) {
+  localStorage.setItem('espanol_tt_v1', JSON.stringify(st));
+}
+
+function saveTTSettings() {
+  const st = getTTState();
+  st.settings.daysPerWeek = parseInt(document.getElementById('ttDaysPerWeek').value)||5;
+  st.settings.dailyMins   = parseInt(document.getElementById('ttDailyMins').value)||45;
+  st.settings.examDate    = document.getElementById('ttExamDate').value||'2026-10-01';
+  st.settings.motivation  = document.getElementById('ttMotivation').value||'';
+  saveTTState(st);
+  renderTTCountdown(st.settings.examDate);
+  showToast('Settings saved ✓','');
+}
+
+function resetTTProgress() {
+  if (!confirm('Reset all timetable progress? This cannot be undone.')) return;
+  const st = getTTState();
+  st.tasks = {}; st.checklist = {};
+  saveTTState(st);
+  renderTimetable();
+  showToast('Timetable progress reset.','');
+}
+
+function ttTaskKey(weekNum, dayIdx, taskIdx) {
+  return `w${weekNum}_d${dayIdx}_t${taskIdx}`;
+}
+
+function toggleTTTask(weekNum, dayIdx, taskIdx) {
+  const st = getTTState();
+  const key = ttTaskKey(weekNum, dayIdx, taskIdx);
+  st.tasks[key] = !st.tasks[key];
+  saveTTState(st);
+  updateTTWeekProgress(weekNum);
+  updateTTOverall();
+}
+
+function toggleCLItem(category, idx) {
+  const st = getTTState();
+  const key = `cl_${category}_${idx}`;
+  st.checklist[key] = !st.checklist[key];
+  saveTTState(st);
+  const el = document.querySelector(`[data-cl-key="${key}"]`);
+  if (el) {
+    el.classList.toggle('cl-done', st.checklist[key]);
+    el.querySelector('input[type=checkbox]').checked = !!st.checklist[key];
+  }
+  updateCLCategoryCount(category);
+}
+
+function updateCLCategoryCount(category) {
+  const st = getTTState();
+  const items = TOPIC_CHECKLIST[category];
+  if (!items) return;
+  const done = items.filter((_,i) => st.checklist[`cl_${category}_${i}`]).length;
+  const el = document.querySelector(`[data-cl-cat="${category}"]`);
+  if (el) el.textContent = done + '/' + items.length;
+}
+
+function getTTTotalTasks() {
+  let total = 0;
+  STUDY_PLAN.forEach(ph => ph.weeks.forEach(wk => wk.days.forEach(d => { total += d.tasks.length; })));
+  return total;
+}
+
+function getTTDoneTasks() {
+  const st = getTTState();
+  return Object.values(st.tasks).filter(Boolean).length;
+}
+
+function updateTTWeekProgress(weekNum) {
+  const st = getTTState();
+  let total = 0, done = 0;
+  STUDY_PLAN.forEach(ph => ph.weeks.forEach(wk => {
+    if (wk.weekNum !== weekNum) return;
+    wk.days.forEach((d, di) => {
+      d.tasks.forEach((_, ti) => {
+        total++;
+        if (st.tasks[ttTaskKey(weekNum, di, ti)]) done++;
+      });
+    });
+  }));
+  const pct = total ? Math.round(done/total*100) : 0;
+  const numEl = document.querySelector(`.week-num[data-week="${weekNum}"]`);
+  const progEl = document.querySelector(`.week-prog[data-week="${weekNum}"]`);
+  if (progEl) progEl.textContent = `${done}/${total}`;
+  if (numEl) { numEl.textContent = done === total ? '✓' : weekNum; numEl.className = 'week-num' + (done===total?' done':''); }
+}
+
+function updateTTOverall() {
+  const total = getTTTotalTasks();
+  const done  = getTTDoneTasks();
+  const pct   = total ? Math.round(done/total*100) : 0;
+  const el = document.getElementById('ttOverallProgress');
+  if (!el) return;
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.4rem;">
+      <span style="font-size:0.8rem;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.08em;">Overall Progress</span>
+      <span style="font-size:0.9rem;font-weight:700;color:var(--accent);">${pct}% <span style="color:var(--text3);font-size:0.78rem;">(${done}/${total} tasks)</span></span>
+    </div>
+    <div class="tt-overall-bar"><div class="tt-overall-fill" style="width:${pct}%"></div></div>
+  `;
+}
+
+function renderTTCountdown(examDateStr) {
+  const el = document.getElementById('ttCountdown');
+  if (!el) return;
+  const exam = new Date(examDateStr || '2026-10-01');
+  const now  = new Date();
+  const diff = Math.ceil((exam - now) / 86400000);
+  const weeks = Math.floor(diff / 7);
+  const days  = diff % 7;
+  if (diff < 0) {
+    el.innerHTML = `<div style="font-size:2rem;">🎓</div><div><div style="font-weight:700;font-size:1.1rem;">Exam day has passed!</div><div style="color:var(--text3);font-size:0.85rem;">¡Esperamos que haya ido muy bien!</div></div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div style="display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap;">
+      <div style="text-align:center"><div class="countdown-num">${diff}</div><div class="countdown-label">Days left</div></div>
+      <div style="text-align:center"><div class="countdown-num">${weeks}</div><div class="countdown-label">Weeks</div></div>
+      <div style="text-align:center"><div class="countdown-num">${days}</div><div class="countdown-label">+Days</div></div>
+      <div style="flex:1;min-width:180px;">
+        <div style="font-weight:700;font-size:1rem;margin-bottom:0.25rem;">DELE A2 Countdown ⏳</div>
+        <div style="color:var(--text3);font-size:0.85rem;">Exam date: ${exam.toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})}</div>
+        <div style="color:var(--accent3);font-size:0.82rem;margin-top:0.3rem;">¡Tú puedes, Khushi! 🌟</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderTimetable() {
+  const st = getTTState();
+  const container = document.getElementById('ttPhasesContainer');
+  if (!container) return;
+  container.innerHTML = '';
+
+  const phaseColors = { 1:'var(--accent3)', 2:'var(--accent)', 3:'var(--accent4)', 4:'var(--accent2)' };
+
+  STUDY_PLAN.forEach(phase => {
+    const phaseDiv = document.createElement('div');
+    phaseDiv.className = 'phase-block';
+
+    // Count phase progress
+    let phTotal=0, phDone=0;
+    phase.weeks.forEach(wk => wk.days.forEach((d,di) => d.tasks.forEach((_,ti) => {
+      phTotal++; if (st.tasks[ttTaskKey(wk.weekNum,di,ti)]) phDone++;
+    })));
+    const phPct = phTotal ? Math.round(phDone/phTotal*100) : 0;
+
+    phaseDiv.innerHTML = `
+      <div class="phase-title" onclick="togglePhase(this)">
+        <span style="font-size:1.5rem;">${phase.icon}</span>
+        <span>${phase.phaseName}</span>
+        <span class="phase-badge" style="background:${phaseColors[phase.phase]}22;color:${phaseColors[phase.phase]};border:1px solid ${phaseColors[phase.phase]}44;">${phDone}/${phTotal} tasks · ${phPct}%</span>
+        <span class="phase-toggle">▼</span>
+      </div>
+      <div class="phase-weeks" id="phaseWeeks${phase.phase}">
+      </div>
+    `;
+
+    const weeksDiv = phaseDiv.querySelector(`#phaseWeeks${phase.phase}`);
+
+    phase.weeks.forEach(wk => {
+      let wkTotal=0, wkDone=0;
+      wk.days.forEach((d,di) => d.tasks.forEach((_,ti) => {
+        wkTotal++; if (st.tasks[ttTaskKey(wk.weekNum,di,ti)]) wkDone++;
+      }));
+
+      const weekDiv = document.createElement('div');
+      weekDiv.className = 'week-block';
+      weekDiv.innerHTML = `
+        <div class="week-header" onclick="toggleWeek(${wk.weekNum}, this)">
+          <div class="week-num${wkDone===wkTotal?' done':''}" data-week="${wk.weekNum}">${wkDone===wkTotal?'✓':wk.weekNum}</div>
+          <span style="font-size:1.1rem;">${wk.icon}</span>
+          <div>
+            <div class="week-theme">${wk.theme}</div>
+          </div>
+          <span class="week-dates">${wk.dates}</span>
+          <span class="week-prog" data-week="${wk.weekNum}">${wkDone}/${wkTotal}</span>
+          <span class="week-toggle" id="wkToggle${wk.weekNum}">▼</span>
+        </div>
+        <div class="week-body" id="weekBody${wk.weekNum}">
+          ${wk.days.map((d, di) => `
+            <div class="day-row">
+              <div class="day-label">${d.label}</div>
+              <div class="day-content">
+                <div class="day-focus">${d.focus}</div>
+                <div class="task-list">
+                  ${d.tasks.map((task, ti) => {
+                    const key = ttTaskKey(wk.weekNum, di, ti);
+                    const done = !!st.tasks[key];
+                    return `<label class="task-item${done?' checked':''}">
+                      <input type="checkbox" ${done?'checked':''} onchange="toggleTTTask(${wk.weekNum},${di},${ti});this.closest('label').classList.toggle('checked',this.checked);">
+                      ${task}
+                    </label>`;
+                  }).join('')}
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+      weeksDiv.appendChild(weekDiv);
+    });
+
+    container.appendChild(phaseDiv);
+  });
+
+  updateTTOverall();
+  renderTTCountdown(st.settings.examDate);
+}
+
+function renderChecklist() {
+  const st = getTTState();
+  const container = document.getElementById('ttChecklistContainer');
+  if (!container) return;
+  container.innerHTML = '';
+
+  Object.entries(TOPIC_CHECKLIST).forEach(([cat, items]) => {
+    const done = items.filter((_,i) => st.checklist[`cl_${cat}_${i}`]).length;
+    const sec = document.createElement('div');
+    sec.className = 'checklist-section';
+    sec.innerHTML = `
+      <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">
+        <div class="section-label" style="margin:0;">${cat}</div>
+        <span style="font-size:0.78rem;font-weight:700;color:var(--accent3);background:rgba(78,205,196,0.12);padding:0.15rem 0.55rem;border-radius:100px;" data-cl-cat="${cat}">${done}/${items.length}</span>
+      </div>
+      <div class="checklist-grid">
+        ${items.map((item, i) => {
+          const key = `cl_${cat}_${i}`;
+          const checked = !!st.checklist[key];
+          return `<label class="cl-item${checked?' cl-done':''}" data-cl-key="${key}" onclick="toggleCLItem('${cat.replace(/'/g,"\'")}',${i})">
+            <input type="checkbox" ${checked?'checked':''} onclick="event.stopPropagation();">
+            ${item}
+          </label>`;
+        }).join('')}
+      </div>
+    `;
+    container.appendChild(sec);
+  });
+}
+
+function switchTTTab(tab, btn) {
+  document.querySelectorAll('.tt-tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('ttScheduleView').style.display  = tab==='schedule'  ? 'block' : 'none';
+  document.getElementById('ttChecklistView').style.display = tab==='checklist' ? 'block' : 'none';
+  document.getElementById('ttSettingsView').style.display  = tab==='settings'  ? 'block' : 'none';
+  document.getElementById('ttCalendarView').style.display  = tab==='calendar'  ? 'block' : 'none';
+  if (tab === 'calendar') renderCalendarView();
+}
+
+function togglePhase(el) {
+  el.classList.toggle('collapsed');
+  const weeksDiv = el.nextElementSibling;
+  weeksDiv.style.display = el.classList.contains('collapsed') ? 'none' : 'block';
+}
+
+function toggleWeek(weekNum, headerEl) {
+  const body   = document.getElementById('weekBody'+weekNum);
+  const toggle = document.getElementById('wkToggle'+weekNum);
+  if (!body) return;
+  const open = body.classList.toggle('open');
+  toggle.classList.toggle('open', open);
+}
+
+function initTimetable() {
+  const st = getTTState();
+  // Load settings into UI
+  const dpw = document.getElementById('ttDaysPerWeek');
+  const dm  = document.getElementById('ttDailyMins');
+  const ed  = document.getElementById('ttExamDate');
+  const mot = document.getElementById('ttMotivation');
+  if (dfw) dfw.value = st.settings.daysPerWeek || 5;
+  if (dm)  dm.value  = st.settings.dailyMins   || 45;
+  if (ed)  ed.value  = st.settings.examDate    || '2026-10-01';
+  if (mot) mot.value = st.settings.motivation  || '';
+  renderTimetable();
+  renderChecklist();
+  renderTTCountdown(st.settings.examDate);
+  // prime calendar month to current date
+  const _now=new Date(); ttCalYear=_now.getFullYear(); ttCalMonth=_now.getMonth();
+}
+
+// Fix typo in initTimetable
+function initTimetable() {
+  const st = getTTState();
+  const dfw = document.getElementById('ttDaysPerWeek');
+  const dm  = document.getElementById('ttDailyMins');
+  const ed  = document.getElementById('ttExamDate');
+  const mot = document.getElementById('ttMotivation');
+  if (dfw) dfw.value = st.settings.daysPerWeek || 5;
+  if (dm)  dm.value  = st.settings.dailyMins   || 45;
+  if (ed)  ed.value  = st.settings.examDate    || '2026-10-01';
+  if (mot) mot.value = st.settings.motivation  || '';
+  renderTimetable();
+  renderChecklist();
+  renderTTCountdown(st.settings.examDate);
+  // prime calendar month to current date
+  const _now=new Date(); ttCalYear=_now.getFullYear(); ttCalMonth=_now.getMonth();
+}
+
+
+// =========================================
+// CALENDAR VIEW
+// =========================================
+
+let ttCalYear  = 2026;
+let ttCalMonth = 4; // 0-indexed → May = 4
+
+// Build a lookup: "YYYY-M-D" → { weekNum, dayIdx, phase, phaseColor, focus, tasks[] }
+function buildCalLookup() {
+  const lookup = {};
+  const phaseColors = { 1:'var(--accent3)', 2:'var(--accent)', 3:'var(--accent4)', 4:'var(--accent2)' };
+
+  STUDY_PLAN.forEach(phase => {
+    phase.weeks.forEach(wk => {
+      wk.days.forEach((d, di) => {
+        // Parse the date label, e.g. "Thu 1 May", "Wed 1 Oct"
+        const parsed = parseStudyDayLabel(d.label);
+        if (!parsed) return;
+        const key = `${parsed.year}-${parsed.month}-${parsed.date}`;
+        lookup[key] = {
+          weekNum: wk.weekNum,
+          dayIdx: di,
+          phase: phase.phase,
+          phaseColor: phaseColors[phase.phase],
+          focus: d.focus,
+          tasks: d.tasks,
+          label: d.label,
+          weekTheme: wk.theme
+        };
+      });
+    });
+  });
+  return lookup;
+}
+
+const MONTH_NAMES_MAP = {
+  'Jan':0,'Feb':1,'Mar':2,'Apr':3,'May':4,'Jun':5,
+  'Jul':6,'Aug':7,'Sep':8,'Oct':9,'Nov':10,'Dec':11
+};
+
+function parseStudyDayLabel(label) {
+  // Formats: "Thu 1 May", "Wed 1 Oct", "Fri 1 Aug"
+  const m = label.match(/\w+\s+(\d+)\s+(\w+)/);
+  if (!m) return null;
+  const dayNum = parseInt(m[1]);
+  const monthIdx = MONTH_NAMES_MAP[m[2]];
+  if (monthIdx === undefined) return null;
+  const year = (monthIdx >= 4) ? 2026 : 2026; // all dates are in 2026
+  return { year, month: monthIdx, date: dayNum };
+}
+
+let _calLookup = null;
+function getCalLookup() {
+  if (!_calLookup) _calLookup = buildCalLookup();
+  return _calLookup;
+}
+
+function renderCalendarView() {
+  const container = document.getElementById('ttCalGrid');
+  if (!container) return;
+
+  const lookup = getCalLookup();
+  const st = getTTState();
+
+  const year  = ttCalYear;
+  const month = ttCalMonth;
+
+  // Month label
+  const mLabel = new Date(year, month, 1).toLocaleDateString('en-GB', { month:'long', year:'numeric' });
+  document.getElementById('ttCalMonthLabel').textContent = mLabel;
+
+  const firstDay = new Date(year, month, 1).getDay(); // 0=Sun
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+  const daysInPrev  = new Date(year, month, 0).getDate();
+
+  // Mon-first grid: shift so Mon=0
+  const startOffset = (firstDay + 6) % 7;
+
+  const today = new Date();
+  const todayKey = `${today.getFullYear()}-${today.getMonth()}-${today.getDate()}`;
+
+  const phaseColors = { 1:'var(--accent3)', 2:'var(--accent)', 3:'var(--accent4)', 4:'var(--accent2)' };
+
+  let html = '<div class="tt-cal-grid">';
+  // Day headers Mon-Sun
+  ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(d => {
+    html += `<div class="tt-cal-day-header">${d}</div>`;
+  });
+
+  // Prev month filler
+  for (let i = 0; i < startOffset; i++) {
+    const d = daysInPrev - startOffset + 1 + i;
+    html += `<div class="tt-cal-cell other-month"><span class="cal-date-num">${d}</span></div>`;
+  }
+
+  // Current month days
+  for (let d = 1; d <= daysInMonth; d++) {
+    const key = `${year}-${month}-${d}`;
+    const isToday = key === todayKey;
+    const dayData = lookup[key];
+
+    let cellClass = 'tt-cal-cell';
+    if (isToday) cellClass += ' today-cell';
+
+    if (dayData) {
+      // Count task completion
+      const total = dayData.tasks.length;
+      const done  = dayData.tasks.filter((_,ti) => st.tasks[ttTaskKey(dayData.weekNum, dayData.dayIdx, ti)]).length;
+      if (done === total) cellClass += ' study-day all-done';
+      else if (done > 0)  cellClass += ' study-day partial-done';
+      else                cellClass += ' study-day';
+
+      // Progress dots
+      const dots = dayData.tasks.map((_,ti) => {
+        const isDone = st.tasks[ttTaskKey(dayData.weekNum, dayData.dayIdx, ti)];
+        return `<div class="cal-task-dot${isDone?' done':''}"></div>`;
+      }).join('');
+
+      html += `<div class="${cellClass}" onclick="showCalDayDetail('${key}')">
+        <span class="cal-date-num${isToday?' today-num':''}">${d}</span>
+        <span class="cal-phase-dot" style="background:${dayData.phaseColor};"></span>
+        <div class="cal-focus-label">${dayData.focus}</div>
+        <div class="cal-progress-dots">${dots}</div>
+      </div>`;
+    } else {
+      html += `<div class="${cellClass}">
+        <span class="cal-date-num${isToday?' today-num':''}">${d}</span>
+      </div>`;
+    }
+  }
+
+  // Next month filler
+  const totalCells = startOffset + daysInMonth;
+  const remainder  = totalCells % 7 === 0 ? 0 : 7 - (totalCells % 7);
+  for (let i = 1; i <= remainder; i++) {
+    html += `<div class="tt-cal-cell other-month"><span class="cal-date-num">${i}</span></div>`;
+  }
+
+  html += '</div>';
+
+  // Legend
+  html += `<div class="cal-legend">
+    <div class="cal-legend-item"><div style="width:12px;height:12px;border-radius:3px;background:rgba(34,197,94,0.15);border:1px solid rgba(34,197,94,0.4);"></div> All tasks done</div>
+    <div class="cal-legend-item"><div style="width:12px;height:12px;border-radius:3px;background:rgba(245,200,66,0.08);border:1px solid rgba(245,200,66,0.3);"></div> In progress</div>
+    <div class="cal-legend-item"><div class="cal-phase-dot" style="background:var(--accent3);width:10px;height:10px;"></div> Phase 1</div>
+    <div class="cal-legend-item"><div class="cal-phase-dot" style="background:var(--accent);width:10px;height:10px;"></div> Phase 2</div>
+    <div class="cal-legend-item"><div class="cal-phase-dot" style="background:var(--accent4);width:10px;height:10px;"></div> Phase 3</div>
+    <div class="cal-legend-item"><div class="cal-phase-dot" style="background:var(--accent2);width:10px;height:10px;"></div> Phase 4</div>
+  </div>`;
+
+  container.innerHTML = html;
+}
+
+function showCalDayDetail(key) {
+  const lookup = getCalLookup();
+  const dayData = lookup[key];
+  if (!dayData) return;
+
+  const st = getTTState();
+  const detail = document.getElementById('ttCalDetail');
+  const title  = document.getElementById('ttCalDetailTitle');
+  const body   = document.getElementById('ttCalDetailBody');
+
+  title.textContent = dayData.label + ' — ' + dayData.focus;
+
+  const taskHtml = dayData.tasks.map((task, ti) => {
+    const isDone = !!st.tasks[ttTaskKey(dayData.weekNum, dayData.dayIdx, ti)];
+    return `<label class="cal-detail-task${isDone?' checked':''}">
+      <input type="checkbox" ${isDone?'checked':''} 
+        onchange="toggleTTTask(${dayData.weekNum},${dayData.dayIdx},${ti});this.closest('label').classList.toggle('checked',this.checked);renderCalendarView();">
+      ${task}
+    </label>`;
+  }).join('');
+
+  body.innerHTML = `
+    <div style="font-size:0.78rem;color:var(--text3);margin-bottom:0.75rem;text-transform:uppercase;letter-spacing:0.08em;font-weight:700;">Week ${dayData.weekNum} · ${dayData.weekTheme}</div>
+    ${taskHtml}
+  `;
+
+  detail.style.display = 'block';
+  detail.scrollIntoView({ behavior:'smooth', block:'nearest' });
+}
+
+function ttCalPrev() {
+  ttCalMonth--;
+  if (ttCalMonth < 0) { ttCalMonth = 11; ttCalYear--; }
+  document.getElementById('ttCalDetail').style.display = 'none';
+  renderCalendarView();
+}
+function ttCalNext() {
+  ttCalMonth++;
+  if (ttCalMonth > 11) { ttCalMonth = 0; ttCalYear++; }
+  document.getElementById('ttCalDetail').style.display = 'none';
+  renderCalendarView();
+}
+function ttCalToday() {
+  const now = new Date();
+  ttCalYear  = now.getFullYear();
+  ttCalMonth = now.getMonth();
+  document.getElementById('ttCalDetail').style.display = 'none';
+  renderCalendarView();
+}
+
+// Hook into switchTab to init timetable on first open
+const _origSwitchTab = window.switchTab;
+window.switchTab = function(tab) {
+  if (typeof _origSwitchTab === 'function') _origSwitchTab(tab);
+  if (tab === 'timetable') {
+    setTimeout(initTimetable, 50);
+  }
+};
 
 // Add confetti fall animation
 const style = document.createElement('style');
